@@ -8,6 +8,13 @@
 
 preprocessor::preprocessor() {
     include_paths.push_back(".");
+    
+    // Add C++26 predefined macros
+    macros["__STDC_HOSTED__"] = {false, {}, false, {{TokenType::NUMBER, "1", "", 0, 0}}};
+    macros["__cplusplus"] = {false, {}, false, {{TokenType::NUMBER, "202601L", "", 0, 0}}}; // Placeholder for C++26
+    
+    // __has_cpp_attribute support
+    macros["__has_cpp_attribute"] = {true, {"attr"}, false, {}}; // Special handling needed
 }
 
 std::string preprocessor::read_file(const std::string& filename) {
@@ -245,6 +252,8 @@ void preprocessor::handle_directive(PreprocessorState& state, std::vector<Token>
             handle_include(state, output);
         } else if (dir == "undef") {
             handle_undef(state);
+        } else if (dir == "embed") {
+            handle_embed(state, output);
         } else if (dir == "ifdef") {
             handle_ifdef(state, output, false);
         } else if (dir == "ifndef") {
@@ -278,6 +287,44 @@ void preprocessor::handle_undef(PreprocessorState& state) {
     Token name = consume(state);
     if (name.type == TokenType::IDENTIFIER) {
         macros.erase(name.value);
+    }
+}
+
+void preprocessor::handle_embed(PreprocessorState& state, std::vector<Token>& output) {
+    consume(state); // #
+    skip_whitespace(state);
+    consume(state); // embed
+    skip_whitespace(state);
+    
+    Token header = consume(state);
+    std::string filename;
+    if (header.type == TokenType::STRING_LITERAL || header.type == TokenType::HEADER_NAME) {
+        filename = header.value.substr(1, header.value.size() - 2);
+    } else {
+        throw std::runtime_error("Expected header name or string literal after #embed");
+    }
+    
+    std::string path;
+    for (const auto& p : include_paths) {
+        std::filesystem::path full_path = std::filesystem::path(p) / filename;
+        if (std::filesystem::exists(full_path)) {
+            path = full_path.string();
+            break;
+        }
+    }
+    
+    if (path.empty()) {
+        throw std::runtime_error("Could not find embed file: " + filename);
+    }
+    
+    std::ifstream file(path, std::ios::binary);
+    std::vector<unsigned char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    
+    for (size_t i = 0; i < data.size(); ++i) {
+        output.push_back({TokenType::NUMBER, std::to_string((int)data[i]), state.filename, header.line, header.column});
+        if (i + 1 < data.size()) {
+            output.push_back({TokenType::PUNCTUATOR, ",", state.filename, header.line, header.column});
+        }
     }
 }
 
@@ -429,11 +476,20 @@ void preprocessor::handle_define(PreprocessorState& state) {
     if (peek(state).value == "(" && !peek(state).has_whitespace_before) {
         m.is_function_like = true;
         consume(state); // (
-        // Parse parameters... (simplified for now)
+        
         while (peek(state).value != ")" && peek(state).type != TokenType::END_OF_FILE) {
             Token p = consume(state);
-            if (p.type == TokenType::IDENTIFIER) {
-                m.params.push_back(p.value);
+            if (p.value == "...") {
+                m.is_variadic = true;
+                m.params.push_back("__VA_ARGS__");
+            } else if (p.type == TokenType::IDENTIFIER) {
+                if (peek(state).value == "...") {
+                    m.is_variadic = true;
+                    consume(state);
+                    m.params.push_back(p.value);
+                } else {
+                    m.params.push_back(p.value);
+                }
             }
             if (peek(state).value == ",") consume(state);
         }
@@ -460,42 +516,168 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
             handle_directive(state, output);
         } else {
             Token t = consume(state);
-            if (t.type == TokenType::IDENTIFIER && macros.count(t.value)) {
-                // Expand macro
-                auto m = macros[t.value];
-                if (!m.is_function_like) {
-                    for (auto rt : m.replacement_list) {
-                        output.push_back(rt);
+            
+            // Phase 6: String literal concatenation
+            if (t.type == TokenType::STRING_LITERAL) {
+                while (true) {
+                    size_t save_pos = state.pos;
+                    skip_whitespace(state);
+                    Token next = peek(state);
+                    if (next.type == TokenType::STRING_LITERAL) {
+                        consume(state);
+                        // Merge literals
+                        std::string v1 = t.value.substr(0, t.value.size() - 1);
+                        std::string v2 = next.value.substr(1);
+                        t.value = v1 + v2;
+                    } else {
+                        state.pos = save_pos;
+                        break;
                     }
-                } else {
-                    // Function-like expansion
+                }
+            }
+
+            if (t.type == TokenType::IDENTIFIER) {
+                if (t.value == "__LINE__") {
+                    output.push_back({TokenType::NUMBER, std::to_string(t.line), t.filename, t.line, t.column});
+                    continue;
+                } else if (t.value == "__FILE__") {
+                    output.push_back({TokenType::STRING_LITERAL, "\"" + t.filename + "\"", t.filename, t.line, t.column});
+                    continue;
+                }
+                
+                if (t.value == "__has_cpp_attribute") {
                     skip_whitespace(state);
                     if (peek(state).value == "(") {
                         consume(state); // (
-                        std::vector<std::vector<Token>> args;
-                        std::vector<Token> current_arg;
-                        int paren_depth = 0;
-                        while (state.pos < state.tokens.size()) {
-                            Token arg_token = peek(state);
-                            if (arg_token.value == "(") paren_depth++;
-                            if (arg_token.value == ")") {
-                                if (paren_depth == 0) break;
-                                paren_depth--;
+                        skip_whitespace(state);
+                        Token attr = consume(state);
+                        skip_whitespace(state);
+                        consume(state); // )
+                        // Simple implementation: return 0 for all
+                        output.push_back({TokenType::NUMBER, "0", state.filename, t.line, t.column});
+                        continue;
+                    }
+                }
+                
+                if (macros.count(t.value)) {
+                    // Expand macro
+                    auto m = macros[t.value];
+                    if (!m.is_function_like) {
+                        for (auto rt : m.replacement_list) {
+                            output.push_back(rt);
+                        }
+                    } else {
+                        // Function-like expansion
+                        skip_whitespace(state);
+                        if (peek(state).value == "(") {
+                            consume(state); // (
+                            std::vector<std::vector<Token>> args;
+                            std::vector<Token> current_arg;
+                            int paren_depth = 0;
+                            while (state.pos < state.tokens.size()) {
+                                Token arg_token = peek(state);
+                                if (arg_token.value == "(") paren_depth++;
+                                if (arg_token.value == ")") {
+                                    if (paren_depth == 0) break;
+                                    paren_depth--;
+                                }
+                                if (arg_token.value == "," && paren_depth == 0) {
+                                    args.push_back(current_arg);
+                                    current_arg.clear();
+                                    consume(state);
+                                    skip_whitespace(state);
+                                    continue;
+                                }
+                                current_arg.push_back(consume(state));
                             }
-                            if (arg_token.value == "," && paren_depth == 0) {
-                                args.push_back(current_arg);
-                                current_arg.clear();
-                                consume(state);
-                                skip_whitespace(state);
+                            args.push_back(current_arg);
+                            consume(state); // )
+                            
+                        // Replace params with args
+                        for (size_t ri = 0; ri < m.replacement_list.size(); ++ri) {
+                            const auto& rt = m.replacement_list[ri];
+                            
+                            // Stringification #
+                            if (rt.value == "#" && ri + 1 < m.replacement_list.size()) {
+                                const auto& next_rt = m.replacement_list[ri+1];
+                                bool stringified = false;
+                                for (size_t i = 0; i < m.params.size(); ++i) {
+                                    if (next_rt.value == m.params[i]) {
+                                        std::string s = "\"";
+                                        if (i < args.size()) {
+                                            for (const auto& at : args[i]) s += at.value;
+                                        }
+                                        s += "\"";
+                                        output.push_back({TokenType::STRING_LITERAL, s, state.filename, rt.line, rt.column});
+                                        ri++;
+                                        stringified = true;
+                                        break;
+                                    }
+                                }
+                                if (stringified) continue;
+                            }
+
+                            // Token Pasting ##
+                            if (ri + 1 < m.replacement_list.size() && m.replacement_list[ri+1].value == "##") {
+                                // Simple implementation of ##
+                                Token left = rt;
+                                // Expand if left is param
+                                for (size_t i = 0; i < m.params.size(); ++i) {
+                                    if (left.value == m.params[i] && i < args.size() && !args[i].empty()) {
+                                        left = args[i][0]; // Take first token of arg
+                                        break;
+                                    }
+                                }
+                                
+                                ri += 2; // skip ## and right token
+                                if (ri < m.replacement_list.size()) {
+                                    Token right = m.replacement_list[ri];
+                                    for (size_t i = 0; i < m.params.size(); ++i) {
+                                        if (right.value == m.params[i] && i < args.size() && !args[i].empty()) {
+                                            right = args[i][0];
+                                            break;
+                                        }
+                                    }
+                                    output.push_back({left.type, left.value + right.value, state.filename, left.line, left.column});
+                                } else {
+                                    output.push_back(left);
+                                }
                                 continue;
                             }
-                            current_arg.push_back(consume(state));
-                        }
-                        args.push_back(current_arg);
-                        consume(state); // )
-                        
-                        // Replace params with args
-                        for (auto rt : m.replacement_list) {
+                            
+                            if (rt.value == "__VA_OPT__") {
+                                if (ri + 2 < m.replacement_list.size() && 
+                                    m.replacement_list[ri+1].value == "(") {
+                                    ri += 2;
+                                    int v_depth = 1;
+                                    std::vector<Token> opt_content;
+                                    while (ri < m.replacement_list.size() && v_depth > 0) {
+                                        if (m.replacement_list[ri].value == "(") v_depth++;
+                                        if (m.replacement_list[ri].value == ")") v_depth--;
+                                        if (v_depth > 0) opt_content.push_back(m.replacement_list[ri]);
+                                        ri++;
+                                    }
+                                    ri--; // point to ')'
+                                    
+                                    // If __VA_ARGS__ is not empty
+                                    bool va_empty = true;
+                                    if (m.is_variadic) {
+                                        size_t va_idx = m.params.size() - 1;
+                                        if (va_idx < args.size() && !args[va_idx].empty()) {
+                                            va_empty = false;
+                                        }
+                                    }
+                                    
+                                    if (!va_empty) {
+                                        for (const auto& ot : opt_content) {
+                                            // Recursively expand if needed, but for now just add
+                                            output.push_back(ot);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            
                             bool found_param = false;
                             if (rt.type == TokenType::IDENTIFIER) {
                                 for (size_t i = 0; i < m.params.size(); ++i) {
@@ -512,9 +694,12 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
                                 output.push_back(rt);
                             }
                         }
-                    } else {
-                        output.push_back(t);
+                        } else {
+                            output.push_back(t);
+                        }
                     }
+                } else {
+                    output.push_back(t);
                 }
             } else {
                 output.push_back(t);

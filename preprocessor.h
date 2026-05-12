@@ -49,6 +49,7 @@ private:
     void handle_if(PreprocessorState& state, std::vector<Token>& output);
     void handle_ifdef(PreprocessorState& state, std::vector<Token>& output, bool negate);
     void handle_undef(PreprocessorState& state);
+    void handle_embed(PreprocessorState& state, std::vector<Token>& output);
     
     bool evaluate_condition(const std::vector<Token>& tokens);
     void skip_failed_branch(PreprocessorState& state);

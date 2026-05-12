@@ -21,6 +21,18 @@ const char* s = HELLO;
 int d = 42;
 #endif
 
+#embed "test.cpp"
+const char* my_file = {
+#embed "test.cpp"
+};
+
+#define LOG(msg, ...) printf(msg __VA_OPT__(,) __VA_ARGS__)
+#define STR(x) #x
+#define CONCAT(a, b) a ## b
+
 int main() {
+    const char* f = __FILE__;
+    int l = __LINE__;
+    const char* combined = "Hello " "World";
     return 0;
 }
