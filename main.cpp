@@ -2,16 +2,28 @@
 #include <stdio.h>
 #include <iostream>
 #include <vector>
+#include "preprocessor.h"
 
 int main(int ac, char* av[]) {
-    static const int filecount = ac - 1;
     if (ac == 1) {
         std::cout << "usage: compiler <file>" << std::endl;
-    return 1;
+        return 1;
     }
-    static const std::vector<std::string> preprocessed_files;
+    
+    preprocessor pp;
     for (int i = 1; i < ac; i++) {
-        std::cout << "preprocessing " << av[i] << std::endl;
+        try {
+            std::cout << "preprocessing " << av[i] << std::endl;
+            std::vector<Token> tokens = pp.preprocess(av[i]);
+            for (const auto& token : tokens) {
+                if (token.type != TokenType::END_OF_FILE) {
+                    std::cout << token.value;
+                }
+            }
+            std::cout << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
     }
     return 0;
 }
