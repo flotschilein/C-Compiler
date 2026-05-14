@@ -15,14 +15,11 @@ preprocessor::preprocessor() {
     macros["__cplusplus"] = {false, {}, false, {{TokenType::NUMBER, "202601L", "", 0, 0}}};
     macros["__STDC__"] = {false, {}, false, {{TokenType::NUMBER, "1", "", 0, 0}}};
     macros["__STDC_VERSION__"] = {false, {}, false, {{TokenType::NUMBER, "202311L", "", 0, 0}}};
-    macros["__STDC_ISO_10646__"] = {false, {}, false, {{TokenType::NUMBER, "202401L", "", 0, 0}}};
-    macros["__STDC_MB_MIGHT_NEQ_WC__"] = {false, {}, false, {{TokenType::NUMBER, "1", "", 0, 0}}};
     
     macros["__has_cpp_attribute"] = {true, {"attr"}, false, {}};
     macros["__has_c_attribute"] = {true, {"attr"}, false, {}};
     macros["__has_include"] = {true, {"header"}, false, {}};
     macros["__has_include_next"] = {true, {"header"}, false, {}};
-    macros["__has_embed"] = {true, {"header"}, false, {}};
     
     std::time_t now = std::time(nullptr);
     char buf[12];
@@ -126,7 +123,9 @@ std::vector<Token> preprocessor::tokenize(const std::string& source, const std::
     int line = 1;
     int col = 1;
     
-    for (size_t i = 0; i < source.size(); ) {
+    for (size_t i = 0; i < source.size(); ) { if (i % 1000 == 0) std::cerr << "DEBUG tokenize i=" << i << " c=" << source[i] << "
+"; if (i > 100000) { std::cerr << "INFINITE LOOP in tokenizer
+"; break; }
         char c = source[i];
         
         Token token;
@@ -176,8 +175,63 @@ std::vector<Token> preprocessor::tokenize(const std::string& source, const std::
             }
         }
         
-        // Detect string/char literal prefixes: L, u, U, u8
+        // Character/user-defined string literal prefix
         std::string prefix;
+        if ((c == 'u' || c == 'U' || c == 'L') && i + 1 < source.size()) {
+            if (c == 'u' && i + 2 < source.size() && source[i+1] == '8') {
+                char next = source[i+2];
+                if (next == '"' || next == '\'' || next == 'R') {
+                    prefix = "u8";
+                    i += 2;
+                    col += 2;
+                    c = source[i];
+                }
+            }
+            if (prefix.empty()) {
+                char next = source[i+1];
+                if (next == '"' || next == '\'' || next == 'R') {
+                    prefix = std::string(1, c);
+                    i++;
+                    col++;
+                    c = source[i];
+                }
+            }
+        }
+        
+        // Raw string literal: R"delimiter(content)delimiter"
+        if (c == 'R' && i + 1 < source.size() && source[i+1] == '"') {
+            // Actually, R is part of prefix, and the next char should be '"' or '(' after delimiter
+            // But we already consumed the prefix, so c should be '"'
+            // Let me rework this logic
+        }
+        
+        // Raw string literal handling (after prefix consumption)
+        // If we had u8R, uR, UR, LR, or just R and next char is '"'
+        // Actually, we need to re-check. Let me handle raw strings first then fall through.
+        
+        // Reset and properly handle
+        // We'll re-approach this: scan for prefixes including R
+        size_t saved_i = i;
+        int saved_col = col;
+        prefix.clear();
+        
+        // Check for raw string R
+        if (source[i] == 'R' && i + 1 < source.size() && source[i+1] == '"') {
+            // Raw string without prefix: R"(...)"
+            prefix = "";
+            // Don't consume anything, handle below
+        } else if (source[i] == 'R' && i + 2 < source.size() && source[i+1] == '"' && source[i+2] == '(') {
+            // This case is handled below
+        }
+        
+        // Let me redo this properly from the current position
+        // Reset to saved_i
+        i = saved_i;
+        col = saved_col;
+        c = source[i];
+        prefix.clear();
+        
+        // Check for prefix letters
         if ((c == 'u' || c == 'U' || c == 'L') && i + 1 < source.size()) {
             char next = source[i+1];
             if (c == 'u' && i + 2 < source.size() && source[i+1] == '8') {
@@ -334,12 +388,6 @@ std::vector<Token> preprocessor::tokenize(const std::string& source, const std::
                         if (nc == '\'') { i++; col++; continue; }
                         token.value += source[i++];
                         col++;
-                        // After e/E/p/P in a pp-number, consume optional sign
-                        if ((nc == 'e' || nc == 'E' || nc == 'p' || nc == 'P') &&
-                            i < source.size() && (source[i] == '+' || source[i] == '-')) {
-                            token.value += source[i++];
-                            col++;
-                        }
                     } else {
                         break;
                     }
@@ -360,8 +408,6 @@ std::vector<Token> preprocessor::tokenize(const std::string& source, const std::
             "##", "<<", ">>", "::", "->", "++", "--",
             "==", "!=", "<=", ">=", "&&", "||",
             "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-            "<<=", ">>=", "->*", ".*",
-            "%:", "<:", ":>", "<%", "%>",
             "##", "..", "..."
         };
         
@@ -373,32 +419,9 @@ std::vector<Token> preprocessor::tokenize(const std::string& source, const std::
             token.value = three_char;
             i += 3;
             col += 3;
-        } else if (i + 3 < source.size() && source[i] == '%' && source[i+1] == ':' &&
-                   source[i+2] == '%' && source[i+3] == ':') {
-            // %:%: digraph → ##
-            token.type = TokenType::PREPROCESSING_OP;
-            token.value = "##";
-            i += 4;
-            col += 4;
-        } else if (c == '<' && i + 2 < source.size() && source[i+1] == ':' && source[i+2] == ':') {
-            // <:: in C++: if not followed by : or >, treat as < + :: not <: + :
-            if (i + 3 >= source.size() || (source[i+3] != ':' && source[i+3] != '>')) {
-                token.type = TokenType::PUNCTUATOR;
-                token.value = "<";
-                i += 1;
-                col += 1;
-                tokens.push_back(token);
-                continue;
-            }
         } else if (multi_char.count(two_char)) {
             token.type = token.value == "##" ? TokenType::PREPROCESSING_OP : TokenType::PUNCTUATOR;
             token.value = two_char;
-            // Map digraphs to their equivalent primary tokens
-            if (two_char == "<:") token.value = "[";
-            else if (two_char == ":>") token.value = "]";
-            else if (two_char == "<%") token.value = "{";
-            else if (two_char == "%>") token.value = "}";
-            else if (two_char == "%:") token.value = "#";
             i += 2;
             col += 2;
         } else {
@@ -430,39 +453,6 @@ bool preprocessor::has_include_next(const std::string& filename) {
         if (f.good()) return true;
     }
     return false;
-}
-
-long long preprocessor::lookup_attribute(const std::string& name) {
-    static const std::map<std::string, long long> cpp_attrs = {
-        {"noreturn", 200809L},
-        {"carries_dependency", 200809L},
-        {"deprecated", 201309L},
-        {"fallthrough", 201603L},
-        {"nodiscard", 201603L},
-        {"maybe_unused", 201603L},
-        {"likely", 201803L},
-        {"unlikely", 201803L},
-        {"no_unique_address", 201803L},
-        {"gnu::always_inline", 201803L},
-        {"gnu::hot", 201803L},
-        {"gnu::cold", 201803L},
-        {"gnu::pure", 201803L},
-        {"gnu::const", 201803L},
-        {"gnu::flatten", 201803L},
-        {"gnu::used", 201803L},
-    };
-    static const std::map<std::string, long long> c_attrs = {
-        {"deprecated", 202311L},
-        {"fallthrough", 202311L},
-        {"nodiscard", 202311L},
-        {"maybe_unused", 202311L},
-    };
-    auto it = cpp_attrs.find(name);
-    if (it != cpp_attrs.end()) return it->second;
-    it = c_attrs.find(name);
-    if (it != c_attrs.end()) return it->second;
-    // Handle scoped attributes like clang::*, gnu::*, etc. — unknown → 0
-    return 0;
 }
 
 std::vector<Token> preprocessor::preprocess(const std::string& filename) {
@@ -539,53 +529,6 @@ void preprocessor::handle_include(PreprocessorState& state, std::vector<Token>& 
         throw std::runtime_error("File not found: " + filename);
     }
     
-    if (once_files.count(found_path)) return;
-    
-    std::vector<Token> included_tokens = preprocess(found_path);
-    
-    for (const auto& it : included_tokens) {
-        if (it.type != TokenType::END_OF_FILE) {
-            output.push_back(it);
-        }
-    }
-}
-
-void preprocessor::handle_include_next(PreprocessorState& state, std::vector<Token>& output) {
-    consume(state); // #
-    skip_whitespace(state);
-    consume(state); // include_next
-    skip_whitespace(state);
-    
-    Token t = consume(state);
-    std::string filename;
-    
-    if (t.value == "<") {
-        while (peek(state).value != ">" && peek(state).type != TokenType::END_OF_FILE) {
-            filename += consume(state).value;
-        }
-        consume(state); // >
-    } else if (t.type == TokenType::STRING_LITERAL) {
-        filename = t.value.substr(1, t.value.size() - 2);
-    } else {
-        throw std::runtime_error("Invalid #include_next directive");
-    }
-    
-    std::string found_path;
-    for (size_t idx = include_next_index; idx < include_paths.size(); ++idx) {
-        std::filesystem::path p = std::filesystem::path(include_paths[idx]) / filename;
-        std::ifstream f(p);
-        if (f.good()) {
-            found_path = p.string();
-            break;
-        }
-    }
-    
-    if (found_path.empty()) {
-        throw std::runtime_error("File not found: " + filename);
-    }
-    
-    if (once_files.count(found_path)) return;
-    
     std::vector<Token> included_tokens = preprocess(found_path);
     
     for (const auto& it : included_tokens) {
@@ -651,9 +594,7 @@ void preprocessor::handle_line(PreprocessorState& state) {
     }
     
     // Update the line numbers of subsequent tokens
-    // The next source line (at state.pos) should become new_line
-    int next_line = lineno.line + 1;
-    int delta = new_line - next_line;
+    int delta = new_line - lineno.line;
     for (size_t j = state.pos; j < state.tokens.size(); ++j) {
         state.tokens[j].line += delta;
         if (!new_filename.empty()) {
@@ -679,14 +620,7 @@ void preprocessor::handle_pragma(PreprocessorState& state) {
     
     // Handle #pragma once
     if (content == "once") {
-        once_files.insert(state.filename);
-        return;
-    }
-    
-    // Handle #pragma STDC
-    if (content.compare(0, 5, "STDC ") == 0) {
-        // STDC FP_CONTRACT, STDC FENV_ACCESS, STDC CX_LIMITED_RANGE
-        // These are silently accepted (standard allows ignoring them)
+        // Skip this file on subsequent includes - current implementation just ignores
         return;
     }
     
@@ -698,20 +632,12 @@ void preprocessor::handle_directive(PreprocessorState& state, std::vector<Token>
     size_t next_pos = hash_pos + 1;
     while (next_pos < state.tokens.size() && state.tokens[next_pos].type == TokenType::WHITESPACE) next_pos++;
     
-    // Empty directive: # alone on a line — silently ignore
-    if (next_pos >= state.tokens.size() || state.tokens[next_pos].type == TokenType::NEWLINE) {
-        consume(state);
-        return;
-    }
-    
     if (next_pos < state.tokens.size()) {
         std::string dir = state.tokens[next_pos].value;
         if (dir == "define") {
             handle_define(state);
         } else if (dir == "include") {
             handle_include(state, output);
-        } else if (dir == "include_next") {
-            handle_include_next(state, output);
         } else if (dir == "undef") {
             handle_undef(state);
         } else if (dir == "embed") {
@@ -722,19 +648,22 @@ void preprocessor::handle_directive(PreprocessorState& state, std::vector<Token>
             handle_ifdef(state, output, true);
         } else if (dir == "if") {
             handle_if(state, output);
-        } else if (dir == "elif" || dir == "elifdef" || dir == "elifndef" || dir == "else") {
-            consume(state); // #
-            skip_whitespace(state);
-            consume(state); // directive name
+        } else if (dir == "elifdef") {
+            handle_elifdef(state, output, false);
+        } else if (dir == "elifndef") {
+            handle_elifdef(state, output, true);
+        } else if (dir == "elif") {
+            if (!handle_elif(state, output)) {
+                // Unmatched #elif - consume rest of line
+                while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
+                    consume(state);
+                }
+            }
+        } else if (dir == "else" || dir == "endif") {
+            // Unmatched #else or #endif
             while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
                 consume(state);
             }
-            if (peek(state).type == TokenType::NEWLINE) {
-                consume(state);
-            }
-            skip_failed_branch(state, output, true);
-        } else if (dir == "endif") {
-            consume(state);
         } else if (dir == "error") {
             handle_error(state);
         } else if (dir == "warning") {
@@ -746,9 +675,6 @@ void preprocessor::handle_directive(PreprocessorState& state, std::vector<Token>
         } else {
             output.push_back(consume(state));
         }
-    } else if (peek(state).type == TokenType::NEWLINE || peek(state).type == TokenType::END_OF_FILE) {
-        // empty directive (# alone) — silently ignore
-        return;
     } else {
         output.push_back(consume(state));
     }
@@ -786,62 +712,6 @@ void preprocessor::handle_embed(PreprocessorState& state, std::vector<Token>& ou
         throw std::runtime_error("Expected header name or string literal after #embed");
     }
     
-    // Parse optional embed parameters
-    std::vector<Token> prefix_tokens, suffix_tokens, if_empty_tokens;
-    long long limit_val = -1;
-    
-    while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
-        Token kw = consume(state);
-        if (kw.value == "prefix" && peek(state).value == "(") {
-            consume(state); // (
-            int depth = 1;
-            while (depth > 0) {
-                Token pt = consume(state);
-                if (pt.type == TokenType::END_OF_FILE) break;
-                if (pt.value == "(") depth++;
-                else if (pt.value == ")") depth--;
-                if (depth > 0) prefix_tokens.push_back(pt);
-            }
-        } else if (kw.value == "suffix" && peek(state).value == "(") {
-            consume(state); // (
-            int depth = 1;
-            while (depth > 0) {
-                Token pt = consume(state);
-                if (pt.type == TokenType::END_OF_FILE) break;
-                if (pt.value == "(") depth++;
-                else if (pt.value == ")") depth--;
-                if (depth > 0) suffix_tokens.push_back(pt);
-            }
-        } else if (kw.value == "if_empty" && peek(state).value == "(") {
-            consume(state); // (
-            int depth = 1;
-            while (depth > 0) {
-                Token pt = consume(state);
-                if (pt.type == TokenType::END_OF_FILE) break;
-                if (pt.value == "(") depth++;
-                else if (pt.value == ")") depth--;
-                if (depth > 0) if_empty_tokens.push_back(pt);
-            }
-        } else if (kw.value == "limit" && peek(state).value == "(") {
-            consume(state); // (
-            std::vector<Token> limit_tokens;
-            while (peek(state).value != ")") {
-                limit_tokens.push_back(consume(state));
-            }
-            consume(state); // )
-            limit_val = evaluate_expression(limit_tokens);
-        } else if (kw.type == TokenType::WHITESPACE) {
-            continue;
-        } else {
-            // Unknown token, skip rest of line
-            while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
-                consume(state);
-            }
-            break;
-        }
-        skip_whitespace(state);
-    }
-    
     std::string path;
     for (const auto& p : include_paths) {
         std::filesystem::path full_path = std::filesystem::path(p) / filename;
@@ -858,40 +728,10 @@ void preprocessor::handle_embed(PreprocessorState& state, std::vector<Token>& ou
     std::ifstream file(path, std::ios::binary);
     std::vector<unsigned char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     
-    // Apply limit parameter
-    if (limit_val >= 0 && static_cast<size_t>(limit_val) < data.size()) {
-        data.resize(static_cast<size_t>(limit_val));
-    }
-    
-    // Apply if_empty parameter
-    if (data.empty() && !if_empty_tokens.empty()) {
-        for (const auto& t : if_empty_tokens) {
-            output.push_back(t);
-        }
-        return;
-    }
-    
-    // Output prefix tokens
-    if (!prefix_tokens.empty()) {
-        for (const auto& t : prefix_tokens) {
-            output.push_back(t);
-        }
-        output.push_back({TokenType::PUNCTUATOR, ",", state.filename, header.line, header.column});
-    }
-    
-    // Output data bytes
     for (size_t i = 0; i < data.size(); ++i) {
         output.push_back({TokenType::NUMBER, std::to_string((int)data[i]), state.filename, header.line, header.column});
         if (i + 1 < data.size()) {
             output.push_back({TokenType::PUNCTUATOR, ",", state.filename, header.line, header.column});
-        }
-    }
-    
-    // Output suffix tokens
-    if (!suffix_tokens.empty()) {
-        output.push_back({TokenType::PUNCTUATOR, ",", state.filename, header.line, header.column});
-        for (const auto& t : suffix_tokens) {
-            output.push_back(t);
         }
     }
 }
@@ -926,34 +766,7 @@ void preprocessor::handle_if(PreprocessorState& state, std::vector<Token>& outpu
     }
 }
 
-bool preprocessor::handle_elifdef(PreprocessorState& state, std::vector<Token>& output, bool negate) {
-    // Check if this #elifdef is inside an active #if block
-    bool matched = false;
-    size_t saved = state.pos;
-    // Find previous directive by scanning backwards
-    for (int d = 1; saved > 0; ) {
-        saved--;
-        if (state.tokens[saved].type == TokenType::NEWLINE || saved == 0) {
-            size_t check = saved;
-            if (state.tokens[saved].type == TokenType::NEWLINE) check = saved + 1;
-            while (check < state.tokens.size() && state.tokens[check].type == TokenType::WHITESPACE) check++;
-            if (check < state.tokens.size() && state.tokens[check].value == "#") {
-                size_t dir_pos = check + 1;
-                while (dir_pos < state.tokens.size() && state.tokens[dir_pos].type == TokenType::WHITESPACE) dir_pos++;
-                if (dir_pos < state.tokens.size()) {
-                    std::string prev = state.tokens[dir_pos].value;
-                    if (prev == "endif") d++;
-                    else if (prev == "if" || prev == "ifdef" || prev == "ifndef") {
-                        d--;
-                        if (d == 0) { matched = true; break; }
-                    }
-                }
-            }
-        }
-    }
-    
-    if (!matched) return false;
-    
+void preprocessor::handle_elifdef(PreprocessorState& state, std::vector<Token>& output, bool negate) {
     consume(state); // #
     skip_whitespace(state);
     consume(state); // elifdef/elifndef
@@ -963,7 +776,9 @@ bool preprocessor::handle_elifdef(PreprocessorState& state, std::vector<Token>& 
     bool exists = macros.count(name.value) > 0;
     bool condition = negate ? !exists : exists;
     
+    // If condition is false, skip this branch
     if (!condition) {
+        // Consume rest of line
         while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
             consume(state);
         }
@@ -972,7 +787,6 @@ bool preprocessor::handle_elifdef(PreprocessorState& state, std::vector<Token>& 
         }
         skip_failed_branch(state, output);
     }
-    return true;
 }
 
 bool preprocessor::handle_elif(PreprocessorState& state, std::vector<Token>& output) {
@@ -1020,7 +834,7 @@ bool preprocessor::handle_elif(PreprocessorState& state, std::vector<Token>& out
     return false;
 }
 
-long long preprocessor::evaluate_expression(const std::vector<Token>& tokens) {
+bool preprocessor::evaluate_condition(const std::vector<Token>& tokens) {
     // Step 1: Handle defined(), __has_include(), __has_include_next(), __has_cpp_attribute(), __has_c_attribute()
     std::vector<Token> processed;
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -1070,50 +884,15 @@ long long preprocessor::evaluate_expression(const std::vector<Token>& tokens) {
             while (i < tokens.size() && tokens[i].type == TokenType::WHITESPACE) i++;
             if (i < tokens.size() && tokens[i].value == "(") {
                 i++;
-                std::string attr_name;
-                while (i < tokens.size() && tokens[i].value != ")") {
-                    if (tokens[i].type == TokenType::IDENTIFIER) {
-                        if (!attr_name.empty()) attr_name += "::";
-                        attr_name += tokens[i].value;
-                    }
-                    i++;
-                }
-                processed.push_back({TokenType::NUMBER, std::to_string(lookup_attribute(attr_name)), "", 0, 0});
-            }
-            continue;
-        }
-        
-        if (tokens[i].value == "__has_embed") {
-            i++;
-            while (i < tokens.size() && tokens[i].type == TokenType::WHITESPACE) i++;
-            if (i < tokens.size() && tokens[i].value == "(") {
-                i++;
-                std::string inc;
-                while (i < tokens.size() && tokens[i].value != ")") {
-                    if (tokens[i].type == TokenType::STRING_LITERAL) {
-                        inc = tokens[i].value.substr(1, tokens[i].value.size() - 2);
-                    }
-                    i++;
-                }
-                bool found = has_include(inc);
-                processed.push_back({TokenType::NUMBER, found ? "1" : "0", "", 0, 0});
+                while (i < tokens.size() && tokens[i].value != ")") i++;
+                processed.push_back({TokenType::NUMBER, "0", "", 0, 0});
             }
             continue;
         }
         
         if (tokens[i].type == TokenType::IDENTIFIER && tokens[i].value != "true" && tokens[i].value != "false") {
-            // Check if it's a predefined object-like macro
-            auto mit = macros.find(tokens[i].value);
-            if (mit != macros.end() && !mit->second.is_function_like && !mit->second.replacement_list.empty()) {
-                for (const auto& rt : mit->second.replacement_list) {
-                    if (rt.type != TokenType::WHITESPACE) {
-                        processed.push_back(rt);
-                    }
-                }
-            } else {
-                // Unbound identifier resolves to 0
-                processed.push_back({TokenType::NUMBER, "0", "", 0, 0});
-            }
+            // Unbound identifier resolves to 0
+            processed.push_back({TokenType::NUMBER, "0", "", 0, 0});
         } else if (tokens[i].type != TokenType::WHITESPACE) {
             processed.push_back(tokens[i]);
         }
@@ -1249,14 +1028,10 @@ long long preprocessor::evaluate_expression(const std::vector<Token>& tokens) {
         return left;
     };
     
-    return parse_or();
+    return parse_or() != 0;
 }
 
-bool preprocessor::evaluate_condition(const std::vector<Token>& tokens) {
-    return evaluate_expression(tokens) != 0;
-}
-
-void preprocessor::skip_failed_branch(PreprocessorState& state, std::vector<Token>& output, bool skip_all) {
+void preprocessor::skip_failed_branch(PreprocessorState& state, std::vector<Token>& output) {
     int depth = 1;
     while (depth > 0 && state.pos < state.tokens.size()) {
         if (is_directive(state.tokens, state.pos)) {
@@ -1271,27 +1046,26 @@ void preprocessor::skip_failed_branch(PreprocessorState& state, std::vector<Toke
                 } else if (dir == "endif") {
                     depth--;
                 } else if (dir == "else" && depth == 1) {
-                    if (!skip_all) {
-                        state.pos = next_pos;
-                        consume(state);
-                        return;
-                    }
+                    state.pos = next_pos;
+                    consume(state); // consume 'else'
+                    return;
                 } else if (dir == "elif" && depth == 1) {
                     state.pos = next_pos;
-                    consume(state);
+                    consume(state); // consume 'elif'
                     std::vector<Token> condition_tokens;
                     while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
                         condition_tokens.push_back(consume(state));
                     }
-                    if (!skip_all && evaluate_condition(condition_tokens)) {
+                    if (evaluate_condition(condition_tokens)) {
                         return;
                     }
                 } else if (dir == "elifdef" && depth == 1) {
                     state.pos = next_pos;
-                    consume(state);
+                    consume(state); // consume 'elifdef'
                     skip_whitespace(state);
                     Token name = consume(state);
-                    if (!skip_all && macros.count(name.value) > 0) {
+                    bool exists = macros.count(name.value) > 0;
+                    if (exists) {
                         while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
                             consume(state);
                         }
@@ -1299,10 +1073,11 @@ void preprocessor::skip_failed_branch(PreprocessorState& state, std::vector<Toke
                     }
                 } else if (dir == "elifndef" && depth == 1) {
                     state.pos = next_pos;
-                    consume(state);
+                    consume(state); // consume 'elifndef'
                     skip_whitespace(state);
                     Token name = consume(state);
-                    if (!skip_all && macros.count(name.value) == 0) {
+                    bool exists = macros.count(name.value) > 0;
+                    if (!exists) {
                         while (peek(state).type != TokenType::NEWLINE && peek(state).type != TokenType::END_OF_FILE) {
                             consume(state);
                         }
@@ -1400,23 +1175,13 @@ std::vector<Token> preprocessor::expand_tokens(std::vector<Token> tokens, std::s
                         check++;
                     }
                     args.push_back(current_arg);
-                    // Pad missing variadic args with empty
-                    if (m.is_variadic && args.size() < m.params.size()) {
-                        args.push_back({});
-                    }
                     check++; // skip )
                     
                     i = check; // advance past the entire invocation
                     
                     auto expanded = expand_function_like(m, args, expanding);
                     for (auto& et : expanded) {
-                        if (et.value == "__LINE__") {
-                            result.push_back({TokenType::NUMBER, std::to_string(t.line), t.filename, t.line, t.column});
-                        } else if (et.value == "__FILE__") {
-                            result.push_back({TokenType::STRING_LITERAL, "\"" + t.filename + "\"", t.filename, t.line, t.column});
-                        } else {
-                            result.push_back(et);
-                        }
+                        result.push_back(et);
                     }
                     continue;
                 }
@@ -1427,13 +1192,7 @@ std::vector<Token> preprocessor::expand_tokens(std::vector<Token> tokens, std::s
                 new_expanding.insert(t.value);
                 auto further = expand_tokens(m.replacement_list, new_expanding);
                 for (auto& ft : further) {
-                    if (ft.value == "__LINE__") {
-                        result.push_back({TokenType::NUMBER, std::to_string(t.line), t.filename, t.line, t.column});
-                    } else if (ft.value == "__FILE__") {
-                        result.push_back({TokenType::STRING_LITERAL, "\"" + t.filename + "\"", t.filename, t.line, t.column});
-                    } else {
-                        result.push_back(ft);
-                    }
+                    result.push_back(ft);
                 }
                 continue;
             }
@@ -1471,13 +1230,8 @@ std::vector<Token> preprocessor::expand_tokens(std::vector<Token> tokens, std::s
                             unescaped += s[si];
                         }
                     }
-                    // Re-tokenize the unescaped pragma content
-                    auto pragma_toks = tokenize(unescaped, t.filename);
-                    for (auto& pt : pragma_toks) {
-                        if (pt.type != TokenType::END_OF_FILE && pt.type != TokenType::NEWLINE) {
-                            result.push_back(pt);
-                        }
-                    }
+                    // Output the pragma as a string literal
+                    result.push_back({TokenType::STRING_LITERAL, "\"" + unescaped + "\"", t.filename, t.line, t.column});
                 }
                 continue;
             }
@@ -1497,42 +1251,25 @@ std::vector<Token> preprocessor::expand_function_like(Macro& m, std::vector<std:
     std::set<size_t> paste_left_params;
     std::set<size_t> paste_right_params;
     
-    auto skip_ws = [&](size_t idx) -> size_t {
-        while (idx < m.replacement_list.size() && m.replacement_list[idx].type == TokenType::WHITESPACE) idx++;
-        return idx;
-    };
-    
     for (size_t ri = 0; ri < m.replacement_list.size(); ++ri) {
-        size_t next = skip_ws(ri + 1);
-        if (m.replacement_list[ri].value == "#" && next < m.replacement_list.size()) {
+        if (m.replacement_list[ri].value == "#" && ri + 1 < m.replacement_list.size()) {
             for (size_t pi = 0; pi < m.params.size(); ++pi) {
-                if (m.replacement_list[next].value == m.params[pi]) {
+                if (m.replacement_list[ri+1].value == m.params[pi]) {
                     stringify_params.insert(pi);
                 }
             }
         }
-        if (m.replacement_list[ri].value == "##") {
-            size_t prev = ri;
-            // find the previous non-ws token
-            size_t prev_ri = ri;
-            while (prev_ri > 0) {
-                prev_ri--;
-                if (m.replacement_list[prev_ri].type != TokenType::WHITESPACE) break;
-            }
-            if (m.replacement_list[prev_ri].type != TokenType::WHITESPACE) {
-                for (size_t pi = 0; pi < m.params.size(); ++pi) {
-                    if (m.replacement_list[prev_ri].value == m.params[pi]) {
-                        paste_left_params.insert(pi);
-                    }
+        if (ri > 0 && m.replacement_list[ri].value == "##") {
+            for (size_t pi = 0; pi < m.params.size(); ++pi) {
+                if (m.replacement_list[ri-1].value == m.params[pi]) {
+                    paste_left_params.insert(pi);
                 }
             }
-            // Find the next non-ws token after ##
-            size_t next_ri = skip_ws(ri + 1);
-            if (next_ri < m.replacement_list.size()) {
-                for (size_t pi = 0; pi < m.params.size(); ++pi) {
-                    if (m.replacement_list[next_ri].value == m.params[pi]) {
-                        paste_right_params.insert(pi);
-                    }
+        }
+        if (ri + 1 < m.replacement_list.size() && m.replacement_list[ri+1].value == "##") {
+            for (size_t pi = 0; pi < m.params.size(); ++pi) {
+                if (m.replacement_list[ri].value == m.params[pi]) {
+                    paste_right_params.insert(pi);
                 }
             }
         }
@@ -1549,149 +1286,57 @@ std::vector<Token> preprocessor::expand_function_like(Macro& m, std::vector<std:
     std::vector<Token> result;
     
     for (size_t ri = 0; ri < m.replacement_list.size(); ++ri) {
-        if (m.replacement_list[ri].type == TokenType::WHITESPACE) continue;
         const auto& rt = m.replacement_list[ri];
         
-        // Stringification # (skip whitespace after #)
-        if (rt.value == "#") {
-            size_t str_next = ri + 1;
-            while (str_next < m.replacement_list.size() && m.replacement_list[str_next].type == TokenType::WHITESPACE) str_next++;
-            if (str_next < m.replacement_list.size()) {
-                bool stringified = false;
-                for (size_t i = 0; i < m.params.size(); ++i) {
-                    if (m.replacement_list[str_next].value == m.params[i]) {
-                        std::string s = "\"";
-                        if (i < args.size()) {
-                            for (const auto& at : args[i]) {
-                                for (char c : at.value) {
-                                    if (c == '"' || c == '\\') s += '\\';
-                                    s += c;
-                                }
-                            }
-                        }
-                        s += "\"";
-                        result.push_back({TokenType::STRING_LITERAL, s, rt.filename, rt.line, rt.column});
-                        ri = str_next;
-                        stringified = true;
-                        break;
-                    }
-                }
-                if (stringified) continue;
-            }
-        }
-        
-        // Token Pasting ## (handles chained: a ## b ## c)
-        {
-            // Find next non-whitespace token
-            size_t next_ri = ri + 1;
-            while (next_ri < m.replacement_list.size() && m.replacement_list[next_ri].type == TokenType::WHITESPACE) next_ri++;
-            if (next_ri < m.replacement_list.size() && m.replacement_list[next_ri].value == "##") {
-                // Helper: get the effective token from a parameter argument
-                // Returns {found, empty, type, val} where:
-                //   found = token matched a parameter
-                //   empty = the argument exists but has no non-WS tokens
-                //   type/val = the first or last non-WS token of the argument
-                struct Resolved { bool found; bool empty; TokenType type; std::string val; };
-                auto resolve_param = [&](const std::string& name, size_t& first_idx_out, bool want_last) -> Resolved {
-                    for (size_t ai = 0; ai < m.params.size(); ++ai) {
-                        if (name == m.params[ai] && ai < args.size()) {
-                            first_idx_out = ai;
-                            // Find the first/last non-WS token in the argument
-                            if (want_last) {
-                                for (int j = (int)args[ai].size() - 1; j >= 0; --j) {
-                                    if (args[ai][j].type != TokenType::WHITESPACE) {
-                                        return {true, false, args[ai][j].type, args[ai][j].value};
-                                    }
-                                }
-                                return {true, true, TokenType::IDENTIFIER, ""};
-                            } else {
-                                for (size_t j = 0; j < args[ai].size(); ++j) {
-                                    if (args[ai][j].type != TokenType::WHITESPACE) {
-                                        return {true, false, args[ai][j].type, args[ai][j].value};
-                                    }
-                                }
-                                return {true, true, TokenType::IDENTIFIER, ""};
+        // Stringification #
+        if (rt.value == "#" && ri + 1 < m.replacement_list.size()) {
+            const auto& next_rt = m.replacement_list[ri+1];
+            bool stringified = false;
+            for (size_t i = 0; i < m.params.size(); ++i) {
+                if (next_rt.value == m.params[i]) {
+                    std::string s = "\"";
+                    if (i < args.size()) {
+                        for (const auto& at : args[i]) {
+                            for (char c : at.value) {
+                                if (c == '"' || c == '\\') s += '\\';
+                                s += c;
                             }
                         }
                     }
-                    first_idx_out = (size_t)-1;
-                    return {false, false, TokenType::IDENTIFIER, ""};
-                };
-                
-                // Start with the current token as the accumulated paste value
-                size_t left_ai = (size_t)-1;
-                auto left = resolve_param(rt.value, left_ai, true);
-                bool left_effective = left.found ? !left.empty : true;
-                TokenType acc_type = left.found ? left.type : rt.type;
-                std::string acc_val = left.found ? left.val : rt.value;
-                // Output non-last tokens of left param (excluding trailing WS)
-                if (left_ai != (size_t)-1 && !left.empty) {
-                    int last_nz = (int)args[left_ai].size() - 1;
-                    while (last_nz >= 0 && args[left_ai][last_nz].type == TokenType::WHITESPACE) last_nz--;
-                    for (int j = 0; j < last_nz; ++j) {
-                        result.push_back(args[left_ai][j]);
-                    }
-                }
-                if (!left_effective) acc_val = ""; // empty placemarker
-                
-                ri = next_ri; // ri is at first ##
-                
-                while (true) {
-                    // Skip past ## and any whitespace to find the right token
-                    size_t right_ri = ri + 1;
-                    while (right_ri < m.replacement_list.size() && m.replacement_list[right_ri].type == TokenType::WHITESPACE) right_ri++;
-                    if (right_ri >= m.replacement_list.size()) {
-                        if (left_effective) {
-                            result.push_back({acc_type, acc_val, rt.filename, rt.line, rt.column});
-                        }
-                        ri = right_ri - 1;
-                        break;
-                    }
-                    
-                    Token right = m.replacement_list[right_ri];
-                    size_t right_ai = (size_t)-1;
-                    auto right_res = resolve_param(right.value, right_ai, false);
-                    bool right_effective = right_res.found ? !right_res.empty : true;
-                    std::string rt_val = right_res.found ? right_res.val : right.value;
-                    // Output remaining right-arg tokens (after first, excluding leading WS)
-                    if (right_ai != (size_t)-1 && !right_res.empty) {
-                        size_t first_nz = 0;
-                        while (first_nz < args[right_ai].size() && args[right_ai][first_nz].type == TokenType::WHITESPACE) first_nz++;
-                        for (size_t j = first_nz + 1; j < args[right_ai].size(); ++j) {
-                            result.push_back(args[right_ai][j]);
-                        }
-                    }
-                    if (!right_effective) rt_val = "";
-                    
-                    // Special case: , ## empty_va_args → delete the comma too
-                    if (right_res.found && right_res.empty && acc_val == ",") {
-                        acc_val = "";
-                        left_effective = false;
-                    } else if (left_effective || right_effective) {
-                        if (!left_effective) { acc_type = right_res.found ? right_res.type : right.type; }
-                        acc_val = acc_val + rt_val;
-                    } else {
-                        acc_val = "";
-                        left_effective = false;
-                    }
-                    if (right_effective && !acc_val.empty()) left_effective = true;
-                    ri = right_ri; // advance past right token
-                    
-                    // Check if another ## follows
-                    size_t next2 = ri + 1;
-                    while (next2 < m.replacement_list.size() && m.replacement_list[next2].type == TokenType::WHITESPACE) next2++;
-                    if (next2 < m.replacement_list.size() && m.replacement_list[next2].value == "##") {
-                        ri = next2; // advance to next ##, loop again
-                        continue;
-                    }
-                    
-                    if (left_effective || (left.found && !left.empty)) {
-                        result.push_back({acc_type, acc_val, rt.filename, rt.line, rt.column});
-                    }
+                    s += "\"";
+                    result.push_back({TokenType::STRING_LITERAL, s, rt.filename, rt.line, rt.column});
+                    ri++;
+                    stringified = true;
                     break;
                 }
-                continue;
             }
+            if (stringified) continue;
+        }
+        
+        // Token Pasting ##
+        if (ri + 1 < m.replacement_list.size() && m.replacement_list[ri+1].value == "##") {
+            Token left = rt;
+            for (size_t i = 0; i < m.params.size(); ++i) {
+                if (left.value == m.params[i] && i < args.size() && !args[i].empty()) {
+                    left = args[i][0];
+                    break;
+                }
+            }
+            
+            ri += 2; // skip ## and right token
+            if (ri < m.replacement_list.size()) {
+                Token right = m.replacement_list[ri];
+                for (size_t i = 0; i < m.params.size(); ++i) {
+                    if (right.value == m.params[i] && i < args.size() && !args[i].empty()) {
+                        right = args[i][0];
+                        break;
+                    }
+                }
+                result.push_back({left.type, left.value + right.value, rt.filename, left.line, left.column});
+            } else {
+                result.push_back(left);
+            }
+            continue;
         }
         
         // __VA_OPT__
@@ -1758,10 +1403,11 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
     state.filename = tokens.empty() ? "" : tokens[0].filename;
     
     std::vector<Token> output;
-    int phase4_iters = 0;
     
     while (state.pos < state.tokens.size()) {
-        if (state.tokens[state.pos].type == TokenType::END_OF_FILE) break;
+            static int loop_count = 0; if (++loop_count % 1000 == 0) std::cerr << "DEBUG run_phases_4 pos=" << state.pos << "/" << state.tokens.size() << "
+"; if (loop_count > 100000) { std::cerr << "INFINITE LOOP in run_phases_4
+"; break; }
         if (is_directive(state.tokens, state.pos)) {
             handle_directive(state, output);
         } else {
@@ -1829,17 +1475,11 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
                     skip_whitespace(state);
                     if (peek(state).value == "(") {
                         consume(state);
-                        std::string attr_name;
-                        while (peek(state).value != ")") {
-                            Token at = consume(state);
-                            if (at.type == TokenType::IDENTIFIER) {
-                                if (!attr_name.empty()) attr_name += "::";
-                                attr_name += at.value;
-                            }
-                        }
+                        skip_whitespace(state);
+                        Token attr = consume(state);
+                        skip_whitespace(state);
                         consume(state); // )
-                        long long ver = lookup_attribute(attr_name);
-                        output.push_back({TokenType::NUMBER, std::to_string(ver), state.filename, t.line, t.column});
+                        output.push_back({TokenType::NUMBER, "0", state.filename, t.line, t.column});
                         continue;
                     }
                 }
@@ -1863,29 +1503,6 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
                     }
                 }
                 
-                if (t.value == "__has_embed") {
-                    skip_whitespace(state);
-                    if (peek(state).value == "(") {
-                        consume(state);
-                        std::string inc;
-                        while (peek(state).value != ")") {
-                            Token ht = consume(state);
-                            if (ht.type == TokenType::STRING_LITERAL || ht.type == TokenType::HEADER_NAME) {
-                                inc = ht.value.substr(1, ht.value.size() - 2);
-                            }
-                        }
-                        consume(state); // )
-                        bool found = has_include(inc);
-                        output.push_back({TokenType::NUMBER, found ? "1" : "0", state.filename, t.line, t.column});
-                        continue;
-                    }
-                }
-                
-                if (t.value == "__COUNTER__") {
-                    output.push_back({TokenType::NUMBER, std::to_string(counter_value++), state.filename, t.line, t.column});
-                    continue;
-                }
-                
                 if (macros.count(t.value)) {
                     auto& m = macros[t.value];
                     std::set<std::string> expanding;
@@ -1895,13 +1512,7 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
                         auto expanded = expand_tokens(m.replacement_list, expanding);
                         for (auto& et : expanded) {
                             if (et.type != TokenType::END_OF_FILE) {
-                                if (et.value == "__LINE__") {
-                                    output.push_back({TokenType::NUMBER, std::to_string(t.line), t.filename, t.line, t.column});
-                                } else if (et.value == "__FILE__") {
-                                    output.push_back({TokenType::STRING_LITERAL, "\"" + t.filename + "\"", t.filename, t.line, t.column});
-                                } else {
-                                    output.push_back(et);
-                                }
+                                output.push_back(et);
                             }
                         }
                     } else {
@@ -1928,22 +1539,12 @@ std::vector<Token> preprocessor::run_phases_4(std::vector<Token>& tokens) {
                                 current_arg.push_back(consume(state));
                             }
                             args.push_back(current_arg);
-                            // Pad missing variadic args with empty
-                            if (m.is_variadic && args.size() < m.params.size()) {
-                                args.push_back({});
-                            }
                             consume(state); // )
                             
                             auto expanded = expand_function_like(m, args, expanding);
                             for (auto& et : expanded) {
                                 if (et.type != TokenType::END_OF_FILE) {
-                                    if (et.value == "__LINE__") {
-                                        output.push_back({TokenType::NUMBER, std::to_string(t.line), t.filename, t.line, t.column});
-                                    } else if (et.value == "__FILE__") {
-                                        output.push_back({TokenType::STRING_LITERAL, "\"" + t.filename + "\"", t.filename, t.line, t.column});
-                                    } else {
-                                        output.push_back(et);
-                                    }
+                                    output.push_back(et);
                                 }
                             }
                         } else {
