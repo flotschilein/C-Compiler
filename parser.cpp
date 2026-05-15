@@ -710,6 +710,19 @@ Type Parser::parse_declaration_specifiers(bool allow_typedef) {
                     consume(); // '<'
                     std::vector<Type> targs;
                     while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+                        if (peek().kind == TokenKind::RSHIFT) {
+                            consume();
+                            // Inject a GT token so the outer template sees its closing >
+                            // Insert at current position
+                            ParserToken gt;
+                            gt.kind = TokenKind::GT;
+                            gt.value = ">";
+                            gt.filename = peek(-1).filename;
+                            gt.line = peek(-1).line;
+                            gt.column = peek(-1).column;
+                            tokens.insert(tokens.begin() + pos, gt);
+                            break;
+                        }
                         targs.push_back(parse_type_name());
                         if (peek().kind == TokenKind::COMMA) consume();
                         else if (peek().kind == TokenKind::GT) break;
@@ -1218,10 +1231,20 @@ std::vector<std::unique_ptr<TemplateParamDecl>> Parser::parse_template_parameter
     std::vector<std::unique_ptr<TemplateParamDecl>> params;
     expect(TokenKind::LT, "expected '<' after template");
     while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+        if (peek().kind == TokenKind::RSHIFT) {
+            consume();
+            ParserToken gt;
+            gt.kind = TokenKind::GT;
+            gt.value = ">";
+            gt.filename = peek(-1).filename;
+            gt.line = peek(-1).line;
+            gt.column = peek(-1).column;
+            tokens.insert(tokens.begin() + pos, gt);
+            break;
+        }
         params.push_back(parse_template_parameter());
         if (peek().kind == TokenKind::COMMA) consume();
         else if (peek().kind == TokenKind::GT) break;
-        // Handle >> for nested templates (not yet)
     }
     expect(TokenKind::GT, "expected '>' in template parameter list");
     return params;

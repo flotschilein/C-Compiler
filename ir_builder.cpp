@@ -2,6 +2,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <sstream>
+#include <algorithm>
 
 // --- Utilities ---
 
@@ -43,9 +44,10 @@ size_t IRBuilder::emit(Instruction::Opcode op, IRType result_type,
     return id;
 }
 
-void IRBuilder::push_inst(Instruction inst) {
-    (void)new_value_id();
+size_t IRBuilder::push_inst(Instruction inst) {
+    size_t id = new_value_id();
     current_block->instructions.push_back(std::move(inst));
+    return id;
 }
 
 void IRBuilder::set_block(IRBlock* block) {
@@ -86,6 +88,10 @@ IRPrimitive IRBuilder::lower_prim(PrimitiveKind k) {
         case PrimitiveKind::FLOAT:         return IRPrimitive::F32;
         case PrimitiveKind::DOUBLE:
         case PrimitiveKind::LONGDOUBLE:    return IRPrimitive::F64;
+        case PrimitiveKind::COMPLEX_FLOAT:
+        case PrimitiveKind::COMPLEX_DOUBLE:
+        case PrimitiveKind::COMPLEX_LONGDOUBLE:
+        case PrimitiveKind::TYPEOF_DECLTYPE:
         default:                           return IRPrimitive::I32;
     }
 }
@@ -132,6 +138,98 @@ IRType IRBuilder::lower_type(const Type& ast_type) {
     return lower_prim(ast_type.prim);
 }
 
+// --- Type Size Helpers ---
+
+static long long compute_type_size(const Type& type) {
+    if (type.is_pointer) return 8;
+    if (type.is_array) {
+        long long elem = compute_type_size(*type.element_type);
+        if (auto* cst = std::get_if<long long>(&type.array_size.size))
+            return elem * (*cst);
+        return elem;
+    }
+    if (type.is_struct && type.has_members) {
+        long long total = 0;
+        for (auto& [ft, _] : type.members)
+            total += compute_type_size(ft);
+        return total;
+    }
+    if (type.is_union && type.has_members) {
+        long long max = 0;
+        for (auto& [ft, _] : type.members)
+            max = std::max(max, compute_type_size(ft));
+        return max;
+    }
+    if (type.is_enum) return 4;
+    if (type.is_function) return 8;
+    switch (type.prim) {
+        case PrimitiveKind::VOID:          return 1;
+        case PrimitiveKind::BOOL:          return 1;
+        case PrimitiveKind::CHAR:
+        case PrimitiveKind::S_CHAR:
+        case PrimitiveKind::U_CHAR:        return 1;
+        case PrimitiveKind::SHORT:
+        case PrimitiveKind::U_SHORT:       return 2;
+        case PrimitiveKind::INT:
+        case PrimitiveKind::U_INT:         return 4;
+        case PrimitiveKind::LONG:
+        case PrimitiveKind::U_LONG:
+        case PrimitiveKind::LONGLONG:
+        case PrimitiveKind::U_LONGLONG:    return 8;
+        case PrimitiveKind::FLOAT:         return 4;
+        case PrimitiveKind::DOUBLE:
+        case PrimitiveKind::LONGDOUBLE:    return 8;
+        default:                           return 4;
+    }
+}
+
+static long long compute_field_offset(const Type& struct_type, const std::string& member) {
+    long long offset = 0;
+    for (auto& [ft, name] : struct_type.members) {
+        if (name == member) return offset;
+        offset += compute_type_size(ft);
+    }
+    return -1;
+}
+
+static long long compute_type_align(const Type& type) {
+    if (type.is_pointer) return 8;
+    if (type.is_array) return compute_type_align(*type.element_type);
+    if (type.is_struct && type.has_members) {
+        long long max = 0;
+        for (auto& [ft, _] : type.members)
+            max = std::max(max, compute_type_align(ft));
+        return max > 0 ? max : 1;
+    }
+    if (type.is_union && type.has_members) {
+        long long max = 0;
+        for (auto& [ft, _] : type.members)
+            max = std::max(max, compute_type_align(ft));
+        return max > 0 ? max : 1;
+    }
+    if (type.is_enum) return 4;
+    if (type.is_function) return 8;
+    switch (type.prim) {
+        case PrimitiveKind::VOID:          return 1;
+        case PrimitiveKind::BOOL:          return 1;
+        case PrimitiveKind::CHAR:
+        case PrimitiveKind::S_CHAR:
+        case PrimitiveKind::U_CHAR:        return 1;
+        case PrimitiveKind::SHORT:
+        case PrimitiveKind::U_SHORT:       return 2;
+        case PrimitiveKind::INT:
+        case PrimitiveKind::U_INT:         return 4;
+        case PrimitiveKind::LONG:
+        case PrimitiveKind::U_LONG:
+        case PrimitiveKind::LONGLONG:
+        case PrimitiveKind::U_LONGLONG:    return 8;
+        case PrimitiveKind::FLOAT:         return 4;
+        case PrimitiveKind::DOUBLE:
+        case PrimitiveKind::LONGDOUBLE:    return 8;
+        default:                           return 4;
+    }
+}
+
 // --- Expression Lowering (rvalue) ---
 
 size_t IRBuilder::lower_expr(const Expr& expr) {
@@ -148,14 +246,31 @@ size_t IRBuilder::lower_expr(const Expr& expr) {
     if (auto* e = dynamic_cast<const SubscriptExpr*>(&expr))  return lower_subscript(*e);
     if (auto* e = dynamic_cast<const CommaExpr*>(&expr))      return lower_comma(*e);
     if (auto* e = dynamic_cast<const SizeofExpr*>(&expr))     return lower_sizeof(*e);
+    if (auto* e = dynamic_cast<const AlignofExpr*>(&expr))    return lower_alignof(*e);
+    if (auto* e = dynamic_cast<const GenericExpr*>(&expr)) {
+        if (e->selected_index >= 0 && (size_t)e->selected_index < e->associations.size()) {
+            if (e->associations[e->selected_index].expr)
+                return lower_expr(*e->associations[e->selected_index].expr);
+        }
+        return emit(Instruction::CONST, IRPrimitive::I32, {});
+    }
     if (auto* e = dynamic_cast<const TemplateIdExpr*>(&expr)) return lower_template_id(*e);
     if (dynamic_cast<const NullptrExpr*>(&expr)) {
         return emit(Instruction::CONST, IRTypeFactory::ptr(IRPrimitive::VOID), {});
     }
+    if (auto* e = dynamic_cast<const CompoundLiteralExpr*>(&expr)) {
+        IRType t = lower_type(e->literal_type);
+        size_t addr = emit(Instruction::ALLOCA, IRTypeFactory::ptr(t), {});
+        current_block->instructions.back().extra_type = t.copy();
+        if (e->init) {
+            size_t val = lower_expr(*e->init);
+            emit(Instruction::STORE, IRPrimitive::VOID, {val, addr});
+        }
+        return addr;
+    }
     if (auto* e = dynamic_cast<const InitListExpr*>(&expr)) {
-        // For now, just lower the first element
-        if (!e->inits.empty()) return lower_expr(*e->inits[0]);
-        return emit(Instruction::CONST, IRPrimitive::I32, {});
+        if (e->inits.empty()) return emit(Instruction::CONST, IRPrimitive::I32, {});
+        return lower_expr(*e->inits[0]);
     }
 
     throw std::runtime_error("unhandled expression type in IR builder");
@@ -166,10 +281,7 @@ size_t IRBuilder::lower_expr(const Expr& expr) {
 size_t IRBuilder::lower_expr_addr(const Expr& expr) {
     if (auto* e = dynamic_cast<const IdentifierExpr*>(&expr)) return lower_identifier_addr(*e);
     if (auto* e = dynamic_cast<const MemberExpr*>(&expr)) {
-        // For now, GEP is not fully implemented; just load struct member
-        // This would need struct field offset computation
-        (void)e;
-        return (size_t)-1;
+        return lower_member_addr(*e);
     }
     if (auto* e = dynamic_cast<const SubscriptExpr*>(&expr)) {
         size_t base = lower_expr(*e->base);
@@ -234,6 +346,99 @@ size_t IRBuilder::lower_identifier_addr(const IdentifierExpr& expr) {
 }
 
 size_t IRBuilder::lower_binary(const BinaryExpr& expr) {
+    // Short-circuit logical ops: expand into branches with phi
+    if (expr.op == BinaryOp::AND) {
+        size_t lhs = lower_expr(*expr.lhs);
+        std::string rhs_label = new_label();
+        std::string end_label = new_label();
+        std::string entry_label = current_block->label;
+
+        size_t zero = emit(Instruction::CONST, IRPrimitive::I1, {});
+        current_block->instructions.back().const_val.int_val = 0;
+
+        {
+            Instruction br;
+            br.opcode = Instruction::BR_COND;
+            br.result_type = IRPrimitive::VOID;
+            br.operands = {lhs};
+            br.true_label = rhs_label;
+            br.false_label = end_label;
+            push_inst(std::move(br));
+        }
+
+        set_block(add_block(rhs_label));
+        size_t rhs = lower_expr(*expr.rhs);
+        std::string rhs_block_label = current_block->label;
+        size_t zero_r = emit(Instruction::CONST, lower_type(expr.rhs->result_type), {});
+        current_block->instructions.back().const_val.int_val = 0;
+        size_t cmp = emit(Instruction::NE, IRPrimitive::I1, {rhs, zero_r});
+        {
+            Instruction br;
+            br.opcode = Instruction::BR;
+            br.result_type = IRPrimitive::VOID;
+            br.target_label = end_label;
+            push_inst(std::move(br));
+        }
+
+        set_block(add_block(end_label));
+        Instruction phi;
+        phi.opcode = Instruction::PHI;
+        phi.result_type = IRPrimitive::I1;
+        phi.phi_incoming = {{zero, entry_label}, {cmp, rhs_block_label}};
+        return push_inst(std::move(phi));
+    }
+
+    if (expr.op == BinaryOp::OR) {
+        size_t lhs = lower_expr(*expr.lhs);
+        std::string true_label = new_label();
+        std::string rhs_label = new_label();
+        std::string end_label = new_label();
+        std::string entry_label = current_block->label;
+
+        {
+            Instruction br;
+            br.opcode = Instruction::BR_COND;
+            br.result_type = IRPrimitive::VOID;
+            br.operands = {lhs};
+            br.true_label = true_label;
+            br.false_label = rhs_label;
+            push_inst(std::move(br));
+        }
+
+        set_block(add_block(true_label));
+        size_t one = emit(Instruction::CONST, IRPrimitive::I1, {});
+        current_block->instructions.back().const_val.int_val = 1;
+        std::string true_block_label = current_block->label;
+        {
+            Instruction br;
+            br.opcode = Instruction::BR;
+            br.result_type = IRPrimitive::VOID;
+            br.target_label = end_label;
+            push_inst(std::move(br));
+        }
+
+        set_block(add_block(rhs_label));
+        size_t rhs_val = lower_expr(*expr.rhs);
+        std::string rhs_block_label = current_block->label;
+        size_t zero_r = emit(Instruction::CONST, lower_type(expr.rhs->result_type), {});
+        current_block->instructions.back().const_val.int_val = 0;
+        size_t cmp = emit(Instruction::NE, IRPrimitive::I1, {rhs_val, zero_r});
+        {
+            Instruction br;
+            br.opcode = Instruction::BR;
+            br.result_type = IRPrimitive::VOID;
+            br.target_label = end_label;
+            push_inst(std::move(br));
+        }
+
+        set_block(add_block(end_label));
+        Instruction phi;
+        phi.opcode = Instruction::PHI;
+        phi.result_type = IRPrimitive::I1;
+        phi.phi_incoming = {{one, true_block_label}, {cmp, rhs_block_label}};
+        return push_inst(std::move(phi));
+    }
+
     Instruction::Opcode opcode;
     switch (expr.op) {
         case BinaryOp::ADD:      opcode = Instruction::ADD; break;
@@ -247,104 +452,22 @@ size_t IRBuilder::lower_binary(const BinaryExpr& expr) {
         case BinaryOp::GT:       opcode = Instruction::GT; break;
         case BinaryOp::LE:       opcode = Instruction::LE; break;
         case BinaryOp::GE:       opcode = Instruction::GE; break;
-        case BinaryOp::AND:      opcode = Instruction::LOGIC_AND; break;
-        case BinaryOp::OR:       opcode = Instruction::LOGIC_OR; break;
         case BinaryOp::BIT_AND:  opcode = Instruction::BIT_AND; break;
         case BinaryOp::BIT_OR:   opcode = Instruction::BIT_OR; break;
         case BinaryOp::BIT_XOR:  opcode = Instruction::BIT_XOR; break;
         case BinaryOp::LSHIFT:   opcode = Instruction::SHL; break;
         case BinaryOp::RSHIFT:   opcode = Instruction::SHR; break;
+        default: break;
     }
 
     size_t lhs = lower_expr(*expr.lhs);
     size_t rhs = lower_expr(*expr.rhs);
 
-    // For short-circuit logical ops, we expand into branches
-    if (expr.op == BinaryOp::AND) {
-        auto* lhs_const = dynamic_cast<const ConstantExpr*>(expr.lhs.get());
-        if (lhs_const && !lhs_const->value) {
-            // false && anything -> false
-            return emit(Instruction::CONST, IRPrimitive::I1, {});
-        }
-        // Expand a && b:
-        //   %lhs = ...
-        //   br_cond %lhs, rhs_block, end_block
-        // rhs_block:
-        //   %rhs = ...
-        //   br end_block
-        // end_block:
-        //   %result = phi [0, entry], [%rhs, rhs_block]
-        std::string rhs_label = new_label();
-        std::string end_label = new_label();
-
-        // Remove the rhs emission we already did (we need to redo it in the right block)
-        // Actually, we emitted both sides above. That's wrong for &&.
-        // Let me redo this properly.
-        current_block->instructions.pop_back(); // remove rhs
-        current_block->instructions.pop_back(); // remove lhs
-
-        lhs = lower_expr(*expr.lhs);
-        size_t lhs_bool = emit(Instruction::LOGIC_NOT, IRPrimitive::I1, {lhs});
-        (void)lhs_bool;
-
-        // Actually, br_cond needs an i1. Comparisons already produce i1.
-        // For a general value, we need to convert to bool first.
-        // Let's just use the truth value.
-        Instruction br;
-        br.opcode = Instruction::BR_COND;
-        br.result_type = IRPrimitive::VOID;
-        br.operands = {lhs};
-        br.true_label = rhs_label;
-        br.false_label = end_label;
-        push_inst(std::move(br));
-
-        // rhs_block
-        set_block(add_block(rhs_label));
-        size_t rhs_val = lower_expr(*expr.rhs);
-        Instruction br2;
-        br2.opcode = Instruction::BR;
-        br2.result_type = IRPrimitive::VOID;
-        br2.target_label = end_label;
-        push_inst(std::move(br2));
-
-        // end_block
-        set_block(add_block(end_label));
-        Instruction phi;
-        phi.opcode = Instruction::PHI;
-        phi.result_type = IRPrimitive::I1;
-        phi.phi_incoming = {{0, std::string("L") + std::to_string(next_label_id - 3)}, // entry sentinel
-                            {rhs_val, rhs_label}};
-        // Hmm, the phi needs the value 0 from the entry block
-        // But we didn't emit a 0 constant. Let me fix this approach.
-        // Instead of phi, let's use a simpler approach: select
-        // Actually, the clean way is to emit a const 0 in a specific block.
-        // For now, let me just fall through to the select-based approach.
-        // Remove the phi and use select.
-
-        // Actually, let me step back. The complication here is that for
-        // short-circuit evaluation, the branching approach IS correct,
-        // but implementing it with phi is tricky because of value ordering.
-
-        // For now, let me not do short-circuit expansion in the builder.
-        // Instead, just emit LOGIC_AND and LOGIC_OR as regular operations,
-        // and let a later pass or the codegen handle short-circuit semantics.
-        current_block->instructions.pop_back(); // remove phi
-        // Re-emit the binary op as a simple LOGIC_AND
-        return emit(Instruction::LOGIC_AND, IRPrimitive::I1, {lhs, rhs});
-    }
-
-    if (expr.op == BinaryOp::OR) {
-        // Same simplification: just emit LOGIC_OR
-        return emit(Instruction::LOGIC_OR, IRPrimitive::I1, {lhs, rhs});
-    }
-
-    // For comparisons, result type is always i1
     IRType result_type;
     switch (expr.op) {
         case BinaryOp::EQ: case BinaryOp::NE:
         case BinaryOp::LT: case BinaryOp::GT:
         case BinaryOp::LE: case BinaryOp::GE:
-        case BinaryOp::AND: case BinaryOp::OR:
             result_type = IRPrimitive::I1;
             break;
         default:
@@ -562,24 +685,29 @@ size_t IRBuilder::lower_conditional(const ConditionalExpr& expr) {
     return phi_id;
 }
 
-size_t IRBuilder::lower_member(const MemberExpr& expr) {
-    // s.member or p->member
-    // For now, assume simple struct member access
+size_t IRBuilder::lower_member_addr(const MemberExpr& expr) {
     size_t base = expr.is_arrow
-                  ? lower_expr(*expr.object) // pointer, already computed
-                  : lower_expr_addr(*expr.object); // struct value, get address
+                  ? lower_expr(*expr.object)
+                  : lower_expr_addr(*expr.object);
 
-    // Find field offset in struct definition
-    // For now, just load the first field or return the base
-    // Proper implementation would compute GEP with field index
-    // For simplicity, we just load from the base pointer (first field)
-    if (expr.is_arrow) {
-        return emit(Instruction::LOAD, lower_type(expr.result_type), {base});
-    }
+    Type obj_type = expr.object->result_type;
+    if (expr.is_arrow && obj_type.is_pointer && obj_type.pointee)
+        obj_type = *obj_type.pointee;
 
-    // For direct member access on a struct value, we need the address
-    // and then do a GEP. For now, simplify.
-    return emit(Instruction::LOAD, lower_type(expr.result_type), {base});
+    long long offset = compute_field_offset(obj_type, expr.member);
+    if (offset < 0) return (size_t)-1;
+
+    size_t offset_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+    current_block->instructions.back().const_val.int_val = offset;
+    size_t gep = emit(Instruction::GEP, IRTypeFactory::ptr(IRPrimitive::VOID), {base, offset_val});
+    current_block->instructions.back().extra_type = IRPrimitive::I8;
+    current_block->instructions.back().gep_index = 0;
+    return gep;
+}
+
+size_t IRBuilder::lower_member(const MemberExpr& expr) {
+    size_t addr = lower_member_addr(expr);
+    return emit(Instruction::LOAD, lower_type(expr.result_type), {addr});
 }
 
 size_t IRBuilder::lower_subscript(const SubscriptExpr& expr) {
@@ -599,16 +727,21 @@ size_t IRBuilder::lower_comma(const CommaExpr& expr) {
 }
 
 size_t IRBuilder::lower_sizeof(const SizeofExpr& expr) {
-    long long size = 4; // default
+    long long size = 4;
     if (!expr.is_type) {
-        // sizeof expression
-        IRType t = lower_type(expr.operand->result_type);
-        size = 4; // placeholder
+        size = compute_type_size(expr.operand->result_type);
     } else {
-        size = 4; // placeholder
+        size = compute_type_size(expr.sizeof_type);
     }
     size_t id = emit(Instruction::CONST, IRPrimitive::I64, {});
     current_block->instructions.back().const_val.int_val = size;
+    return id;
+}
+
+size_t IRBuilder::lower_alignof(const AlignofExpr& expr) {
+    long long align = compute_type_align(expr.align_type);
+    size_t id = emit(Instruction::CONST, IRPrimitive::I64, {});
+    current_block->instructions.back().const_val.int_val = align;
     return id;
 }
 
@@ -629,13 +762,44 @@ void IRBuilder::lower_stmt(const Stmt& stmt) {
     if (auto* s = dynamic_cast<const GotoStmt*>(&stmt))       return lower_goto(*s);
     if (auto* s = dynamic_cast<const LabelStmt*>(&stmt))      return lower_label(*s);
     if (auto* s = dynamic_cast<const CaseStmt*>(&stmt)) {
-        (void)s;
-        // TODO: proper switch lowering — for now, just lower the body
+        if (!switch_stack.empty()) {
+            auto& info = switch_stack.back();
+            if (info.next_case_idx < info.cases.size()) {
+                auto& c = info.cases[info.next_case_idx++];
+                // Terminate previous block if needed (fall-through)
+                if (current_block && !current_block->instructions.empty()) {
+                    auto& last = current_block->instructions.back();
+                    if (last.opcode != Instruction::BR && last.opcode != Instruction::BR_COND && last.opcode != Instruction::RET) {
+                        Instruction br;
+                        br.opcode = Instruction::BR;
+                        br.result_type = IRPrimitive::VOID;
+                        br.target_label = c.label;
+                        push_inst(std::move(br));
+                    }
+                }
+                set_block(add_block(c.label));
+            }
+        }
         if (s->body) lower_stmt(*s->body);
         return;
     }
     if (auto* s = dynamic_cast<const DefaultStmt*>(&stmt)) {
-        (void)s;
+        if (!switch_stack.empty()) {
+            auto& info = switch_stack.back();
+            if (!info.default_label.empty()) {
+                if (current_block && !current_block->instructions.empty()) {
+                    auto& last = current_block->instructions.back();
+                    if (last.opcode != Instruction::BR && last.opcode != Instruction::BR_COND && last.opcode != Instruction::RET) {
+                        Instruction br;
+                        br.opcode = Instruction::BR;
+                        br.result_type = IRPrimitive::VOID;
+                        br.target_label = info.default_label;
+                        push_inst(std::move(br));
+                    }
+                }
+                set_block(add_block(info.default_label));
+            }
+        }
         if (s->body) lower_stmt(*s->body);
         return;
     }
@@ -838,19 +1002,102 @@ void IRBuilder::lower_for(const ForStmt& stmt) {
     loop_stack.pop_back();
 }
 
+void IRBuilder::collect_switch_cases(const Stmt& stmt, std::vector<SwitchCase>& cases, std::string& default_label) {
+    if (auto* cs = dynamic_cast<const CaseStmt*>(&stmt)) {
+        long long val = 0;
+        if (auto* ce = dynamic_cast<const ConstantExpr*>(cs->value.get()))
+            val = ce->value;
+        std::string label = "case_" + std::to_string(cases.size());
+        cases.push_back({val, label});
+        if (cs->body) collect_switch_cases(*cs->body, cases, default_label);
+    } else if (auto* ds = dynamic_cast<const DefaultStmt*>(&stmt)) {
+        if (default_label.empty())
+            default_label = "case_default";
+        if (ds->body) collect_switch_cases(*ds->body, cases, default_label);
+    } else if (auto* cs = dynamic_cast<const CompoundStmt*>(&stmt)) {
+        for (auto& s : cs->stmts)
+            if (s) collect_switch_cases(*s, cases, default_label);
+    } else if (auto* is = dynamic_cast<const IfStmt*>(&stmt)) {
+        if (is->then_body) collect_switch_cases(*is->then_body, cases, default_label);
+        if (is->else_body) collect_switch_cases(*is->else_body, cases, default_label);
+    }
+}
+
 void IRBuilder::lower_switch(const SwitchStmt& stmt) {
     size_t cond_id = lower_expr(*stmt.cond);
     std::string end_label = new_label();
 
     loop_stack.push_back({end_label, ""});
 
-    // For switch, we lower the body (which contains case/default labels)
-    // and then emit the end block. A more complete implementation
-    // would collect case values and emit a jump table.
-    (void)cond_id;
+    // Collect case values from body
+    SwitchInfo info;
+    info.cond_id = cond_id;
+    info.end_label = end_label;
+    collect_switch_cases(*stmt.body, info.cases, info.default_label);
 
-    // Switch body
+    // Emit dispatch: if-else chain
+    // Each case: if (cond == val) goto case_label; else next;
+    // Default: goto default_label at end of chain
+    std::string next_label = new_label();
+    Instruction br_first;
+    br_first.opcode = Instruction::BR;
+    br_first.result_type = IRPrimitive::VOID;
+    br_first.target_label = next_label;
+    push_inst(std::move(br_first));
+
+    set_block(add_block(next_label));
+    for (size_t i = 0; i < info.cases.size(); i++) {
+        std::string case_label = info.cases[i].label;
+        long long case_val = info.cases[i].value;
+
+        size_t case_cmp = emit(Instruction::CONST, lower_type(stmt.cond->result_type), {});
+        current_block->instructions.back().const_val.int_val = case_val;
+        size_t eq = emit(Instruction::EQ, IRPrimitive::I1, {cond_id, case_cmp});
+
+        std::string else_label = (i + 1 < info.cases.size()) ? new_label() : info.default_label.empty() ? end_label : info.default_label;
+
+        Instruction brc;
+        brc.opcode = Instruction::BR_COND;
+        brc.result_type = IRPrimitive::VOID;
+        brc.operands = {eq};
+        brc.true_label = case_label;
+        brc.false_label = else_label;
+        push_inst(std::move(brc));
+
+        if (i + 1 < info.cases.size()) {
+            set_block(add_block(else_label));
+        }
+    }
+
+    // If no cases matched and no default, go to end
+    if (info.cases.empty() || (!info.default_label.empty() && info.cases.size() > 0)) {
+        // The last else label is already the current block (default or end)
+    }
+    if (info.cases.empty()) {
+        Instruction br_end;
+        br_end.opcode = Instruction::BR;
+        br_end.result_type = IRPrimitive::VOID;
+        br_end.target_label = end_label;
+        push_inst(std::move(br_end));
+    }
+
+    // Switch body (with case labels)
+    switch_stack.push_back(std::move(info));
     lower_stmt(*stmt.body);
+
+    // If fall-through from last case, branch to end
+    if (current_block && (current_block->instructions.empty() ||
+        (current_block->instructions.back().opcode != Instruction::RET &&
+         current_block->instructions.back().opcode != Instruction::BR &&
+         current_block->instructions.back().opcode != Instruction::BR_COND))) {
+        Instruction br_end;
+        br_end.opcode = Instruction::BR;
+        br_end.result_type = IRPrimitive::VOID;
+        br_end.target_label = end_label;
+        push_inst(std::move(br_end));
+    }
+
+    switch_stack.pop_back();
 
     // End block (for break)
     set_block(add_block(end_label));
@@ -925,18 +1172,40 @@ void IRBuilder::lower_decl(const Decl& decl) {
 }
 
 void IRBuilder::lower_var_decl(const VariableDecl& decl) {
+    if (!current_block) return; // skip globals at module scope for now
+
     IRType var_type = lower_type(decl.var_type);
     size_t alloca_id = emit(Instruction::ALLOCA, IRTypeFactory::ptr(var_type), {});
     current_block->instructions.back().extra_type = var_type.copy();
 
     if (!var_stack.empty())
         var_stack.back()[decl.name] = alloca_id;
-    else
-        ; // global variable, ignore for now
 
     if (decl.init) {
-        size_t init_val = lower_expr(*decl.init);
-        emit(Instruction::STORE, IRPrimitive::VOID, {init_val, alloca_id});
+        // Handle init list directly: store each field to the alloca
+        if (auto* init_list = dynamic_cast<const InitListExpr*>(decl.init.get())) {
+            Type result_type = decl.var_type;
+            if (result_type.is_struct && result_type.has_members) {
+                long long off = 0;
+                for (size_t i = 0; i < init_list->inits.size() && i < result_type.members.size(); i++) {
+                    size_t val = lower_expr(*init_list->inits[i]);
+                    size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+                    current_block->instructions.back().const_val.int_val = off;
+                    size_t field_addr = emit(Instruction::GEP, IRTypeFactory::ptr(IRPrimitive::VOID), {alloca_id, off_val});
+                    current_block->instructions.back().extra_type = IRPrimitive::I8;
+                    current_block->instructions.back().gep_index = 0;
+                    emit(Instruction::STORE, IRPrimitive::VOID, {val, field_addr});
+                    if (i + 1 < result_type.members.size())
+                        off += compute_type_size(result_type.members[i].first);
+                }
+            } else {
+                size_t init_val = lower_expr(*decl.init);
+                emit(Instruction::STORE, IRPrimitive::VOID, {init_val, alloca_id});
+            }
+        } else {
+            size_t init_val = lower_expr(*decl.init);
+            emit(Instruction::STORE, IRPrimitive::VOID, {init_val, alloca_id});
+        }
     }
 }
 

@@ -379,6 +379,7 @@ struct GenericExpr : Expr {
         std::unique_ptr<Expr> expr;
     };
     std::vector<Association> associations;
+    int selected_index = -1;
     void dump(int indent = 0) const override;
 };
 

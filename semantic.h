@@ -45,6 +45,7 @@ private:
     int loop_depth = 0;
     int switch_depth = 0;
     std::set<std::string> template_param_names;
+    std::map<std::string, std::vector<std::pair<Type, std::string>>> struct_defs;
 
     // Declarations
     void visit_decl(Decl& d);
@@ -94,6 +95,9 @@ private:
     Type visit_compound_literal(CompoundLiteralExpr& e);
     Type visit_init_list(InitListExpr& e);
     Type visit_template_id(TemplateIdExpr& e);
+
+    // Helpers
+    void resolve_struct_type(Type& t);
 
     // Helpers
     bool is_arithmetic(const Type& t) const;

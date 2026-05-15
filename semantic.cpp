@@ -133,10 +133,9 @@ int SemanticAnalyzer::type_rank(const Type& t) const {
 
 bool SemanticAnalyzer::types_equal(const Type& a, const Type& b) const {
     if (a.is_typedef || b.is_typedef) {
-        // Template params of the same name are equal
-        if (a.is_typedef && b.is_typedef && a.typedef_name == b.typedef_name)
-            return true;
-        return &a == &b;
+        if (a.is_typedef && b.is_typedef)
+            return a.typedef_name == b.typedef_name;
+        return false;
     }
     if (a.is_pointer && b.is_pointer) return types_equal(*a.pointee, *b.pointee);
     if (a.is_array && b.is_array) return types_equal(*a.element_type, *b.element_type);
@@ -194,6 +193,7 @@ void SemanticAnalyzer::visit_func(FunctionDecl& d) {
     }
 
     // Add function to symbol table
+    resolve_struct_type(d.func_type);
     Symbol s;
     s.name = d.name;
     s.type = d.func_type;
@@ -207,10 +207,12 @@ void SemanticAnalyzer::visit_func(FunctionDecl& d) {
     symtab.push_scope();
     current_return_type = d.func_type.is_function && d.func_type.return_type
         ? *d.func_type.return_type : d.func_type;
+    resolve_struct_type(current_return_type);
 
     // Add parameters to scope
     for (auto& p : d.params) {
         if (auto* pv = dynamic_cast<ParamVarDecl*>(p.get())) {
+            resolve_struct_type(pv->param_type);
             Symbol ps;
             ps.name = pv->name;
             ps.type = pv->param_type;
@@ -230,6 +232,7 @@ void SemanticAnalyzer::visit_func(FunctionDecl& d) {
 }
 
 void SemanticAnalyzer::visit_var(VariableDecl& d) {
+    resolve_struct_type(d.var_type);
     Symbol s;
     s.name = d.name;
     s.type = d.var_type;
@@ -266,14 +269,17 @@ void SemanticAnalyzer::visit_struct(StructDecl& d) {
     s.kind = d.is_union ? Symbol::TAG_UNION : Symbol::TAG_STRUCT;
     symtab.add(s);
 
+    std::vector<std::pair<Type, std::string>> members;
     for (auto& f : d.fields) {
         if (auto* fd = dynamic_cast<FieldDecl*>(f.get())) {
-            // Check field type is complete
+            resolve_struct_type(fd->field_type);
             if (fd->field_type.is_function) {
                 error("function field '" + fd->name + "' in struct", fd->loc);
             }
+            members.push_back({fd->field_type, fd->name});
         }
     }
+    struct_defs[d.name] = std::move(members);
 }
 
 void SemanticAnalyzer::visit_enum(EnumDecl& d) {
@@ -303,7 +309,12 @@ void SemanticAnalyzer::visit_enum(EnumDecl& d) {
 
 void SemanticAnalyzer::visit_static_assert(StaticAssertDecl& d) {
     if (d.condition) {
-        visit_expr(*d.condition);
+        Type t = visit_expr(*d.condition);
+        if (auto* ce = dynamic_cast<ConstantExpr*>(d.condition.get())) {
+            if (!ce->value) {
+                error("static_assert failed: " + d.message, d.loc);
+            }
+        }
     }
 }
 
@@ -710,6 +721,8 @@ Type SemanticAnalyzer::visit_member(MemberExpr& e) {
         obj_type = *obj_type.pointee;
     }
 
+    resolve_struct_type(obj_type);
+
     if (!obj_type.is_struct && !obj_type.is_union) {
         error("member access on non-struct/union type", e.object->loc);
         return Type{};
@@ -826,8 +839,10 @@ Type SemanticAnalyzer::visit_identifier(IdentifierExpr& e) {
     }
 
     switch (s->kind) {
-        case Symbol::VARIABLE:
+        case Symbol::VARIABLE: {
+            resolve_struct_type(s->type);
             return s->type;
+        }
         case Symbol::FUNCTION: {
             Type ft = s->type;
             // Function-to-pointer decay
@@ -848,9 +863,27 @@ Type SemanticAnalyzer::visit_identifier(IdentifierExpr& e) {
     }
 }
 
+void SemanticAnalyzer::resolve_struct_type(Type& t) {
+    if (t.is_pointer && t.pointee) {
+        resolve_struct_type(*t.pointee);
+        return;
+    }
+    if (t.is_array && t.element_type) {
+        resolve_struct_type(*t.element_type);
+        return;
+    }
+    if ((t.is_struct || t.is_union) && !t.has_members && !t.tag_name.empty()) {
+        auto it = struct_defs.find(t.tag_name);
+        if (it != struct_defs.end()) {
+            t.members = it->second;
+            t.has_members = true;
+        }
+    }
+}
+
 Type SemanticAnalyzer::visit_sizeof(SizeofExpr& e) {
     if (e.is_type) {
-        // valid
+        resolve_struct_type(e.sizeof_type);
     } else if (e.operand) {
         visit_expr(*e.operand);
     }
@@ -860,21 +893,43 @@ Type SemanticAnalyzer::visit_sizeof(SizeofExpr& e) {
 }
 
 Type SemanticAnalyzer::visit_alignof(AlignofExpr& e) {
+    resolve_struct_type(e.align_type);
     Type t;
     t.prim = PrimitiveKind::U_LONG;
     return t;
 }
 
 Type SemanticAnalyzer::visit_generic(GenericExpr& e) {
-    if (e.control) visit_expr(*e.control);
+    Type control_type = e.control ? visit_expr(*e.control) : Type{};
     Type result;
-    for (auto& a : e.associations) {
+    int best = -1;
+    for (size_t i = 0; i < e.associations.size(); i++) {
+        auto& a = e.associations[i];
         if (a.is_default) {
-            if (a.expr) result = visit_expr(*a.expr);
+            if (best < 0) {
+                best = (int)i;
+                if (a.expr) result = visit_expr(*a.expr);
+            }
         } else {
-            if (a.expr) result = visit_expr(*a.expr);
+            Type resolved = a.type;
+            resolve_struct_type(resolved);
+            if (types_equal(control_type, resolved)) {
+                best = (int)i;
+                if (a.expr) result = visit_expr(*a.expr);
+                break; // first match wins (C11 standard)
+            }
         }
     }
+    // Visit default if no match
+    if (best < 0) {
+        for (auto& a : e.associations) {
+            if (a.is_default && a.expr) {
+                result = visit_expr(*a.expr);
+                break;
+            }
+        }
+    }
+    e.selected_index = best;
     return result;
 }
 
@@ -892,7 +947,9 @@ Type SemanticAnalyzer::visit_compound_literal(CompoundLiteralExpr& e) {
 }
 
 Type SemanticAnalyzer::visit_init_list(InitListExpr& e) {
-    // Determine type from context
+    for (auto& init : e.inits) {
+        if (init) visit_expr(*init);
+    }
     Type t;
     t.is_array = true;
     t.element_type = std::make_unique<Type>();

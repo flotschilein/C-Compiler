@@ -22,6 +22,19 @@ class IRBuilder {
     };
     std::vector<LoopInfo> loop_stack;
 
+    struct SwitchCase {
+        long long value;
+        std::string label;
+    };
+    struct SwitchInfo {
+        size_t cond_id;
+        std::string end_label;
+        std::vector<SwitchCase> cases;
+        std::string default_label;
+        size_t next_case_idx = 0;
+    };
+    std::vector<SwitchInfo> switch_stack;
+
     // Variable scoping: stack of maps (name → alloca value ID)
     std::vector<std::map<std::string, size_t>> var_stack;
 
@@ -35,7 +48,7 @@ class IRBuilder {
                 std::vector<size_t> operands = {});
     // push_inst: like emit but for pre-built instructions (terminators).
     // Always consumes a value_id to keep IDs in sync across blocks.
-    void push_inst(Instruction inst);
+    size_t push_inst(Instruction inst);
 
     void set_block(IRBlock* block);
     IRBlock* add_block(std::string label = "");
@@ -63,9 +76,11 @@ class IRBuilder {
     size_t lower_assign(const AssignExpr& expr);
     size_t lower_conditional(const ConditionalExpr& expr);
     size_t lower_member(const MemberExpr& expr);
+    size_t lower_member_addr(const MemberExpr& expr);
     size_t lower_subscript(const SubscriptExpr& expr);
     size_t lower_comma(const CommaExpr& expr);
     size_t lower_sizeof(const SizeofExpr& expr);
+    size_t lower_alignof(const AlignofExpr& expr);
 
     void lower_stmt(const Stmt& stmt);
     void lower_compound(const CompoundStmt& stmt);
@@ -87,6 +102,8 @@ class IRBuilder {
     void lower_fn_decl(const FunctionDecl& decl);
     void lower_template_decl(const TemplateDecl& decl);
     size_t lower_template_id(const TemplateIdExpr& expr);
+
+    void collect_switch_cases(const Stmt& stmt, std::vector<SwitchCase>& cases, std::string& default_label);
 
 public:
     explicit IRBuilder(IRModule& mod) : module(mod) {}

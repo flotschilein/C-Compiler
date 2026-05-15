@@ -358,8 +358,9 @@ std::string IRPrinter::print_function(const IRFunction& fn) {
 
             case Instruction::GEP:
                 os << " " << type_to_string(inst.extra_type)
-                   << ", %" << inst.operands[0]
-                   << ", " << inst.gep_index;
+                   << ", %" << inst.operands[0];
+                for (size_t i = 1; i < inst.operands.size(); i++)
+                    os << ", %" << inst.operands[i];
                 break;
 
             case Instruction::CAST: case Instruction::TRUNC:
