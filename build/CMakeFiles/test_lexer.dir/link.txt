@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_lexer.dir/test_lexer.cpp.o CMakeFiles/test_lexer.dir/lexer.cpp.o CMakeFiles/test_lexer.dir/preprocessor.cpp.o CMakeFiles/test_lexer.dir/token.cpp.o -o test_lexer 

@@ -1,3 +1,0 @@
-/home/fbraune/C-Compiler/build/CMakeFiles/C_Compiler.dir
-/home/fbraune/C-Compiler/build/CMakeFiles/edit_cache.dir
-/home/fbraune/C-Compiler/build/CMakeFiles/rebuild_cache.dir
