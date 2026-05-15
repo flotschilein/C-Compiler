@@ -9,6 +9,7 @@
 #include "ir_builder.h"
 #include "ir_printer.h"
 #include "ir_instantiator.h"
+#include "ir_verifier.h"
 
 int main(int ac, char* av[]) {
     if (ac == 1) {
@@ -44,6 +45,17 @@ int main(int ac, char* av[]) {
             IRBuilder builder(mod);
             builder.lower_translation_unit(*ast);
             std::cout << IRPrinter::print_module(mod);
+
+            // IR Verification
+            std::cout << "--- IR Verify ---\n";
+            IRVerifier verifier;
+            verifier.verify(mod);
+            if (verifier.has_errors()) {
+                verifier.print_report();
+                std::cout << "IR verification FAILED\n";
+            } else {
+                std::cout << "  all checks passed\n";
+            }
 
             std::cout << "--- Done ---\n";
         } catch (const std::exception& e) {

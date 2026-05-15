@@ -21,4 +21,5 @@ add_executable(C_Compiler
         ir.h ir.cpp
         ir_printer.h ir_printer.cpp
         ir_builder.h ir_builder.cpp
-        ir_instantiator.h ir_instantiator.cpp)
+        ir_instantiator.h ir_instantiator.cpp
+        ir_verifier.h ir_verifier.cpp)
