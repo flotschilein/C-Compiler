@@ -462,7 +462,12 @@ void preprocessor::handle_embed(PreprocessorState& state, std::vector<Token>& ou
     
     Token header = consume(state);
     std::string filename;
-    if (header.type == TokenType::STRING_LITERAL || header.type == TokenType::HEADER_NAME) {
+    if (header.value == "<") {
+        while (peek(state).value != ">" && peek(state).type != TokenType::END_OF_FILE) {
+            filename += consume(state).value;
+        }
+        consume(state); // >
+    } else if (header.type == TokenType::STRING_LITERAL) {
         filename = header.value.substr(1, header.value.size() - 2);
     } else {
         throw std::runtime_error("Expected header name or string literal after #embed");

@@ -21,9 +21,12 @@ const char* s = HELLO;
 int d = 42;
 #endif
 
-#embed "test.cpp"
-const char* my_file = {
-#embed "test.cpp"
+const unsigned char embed_data1[] = {
+    #embed "test.cpp"
+};
+
+const unsigned char embed_data2[] = {
+    #embed "test.cpp"
 };
 
 #define LOG(msg, ...) printf(msg __VA_OPT__(,) __VA_ARGS__)
