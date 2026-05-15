@@ -2,6 +2,7 @@
 #define C_COMPILER_IR_BUILDER_H
 
 #include "ir.h"
+#include "ir_instantiator.h"
 #include "ast.h"
 #include <map>
 #include <vector>
@@ -9,9 +10,11 @@
 
 class IRBuilder {
     IRModule& module;
-    IRFunction* current_fn = nullptr;
+    size_t current_fn_idx = (size_t)-1;  // index into module.functions
     IRBlock* current_block = nullptr;
     size_t next_label_id = 0;
+    IRFunction* current_fn();
+    void set_current_fn(IRFunction* fn);
 
     struct LoopInfo {
         std::string break_label;
@@ -21,6 +24,9 @@ class IRBuilder {
 
     // Variable scoping: stack of maps (name → alloca value ID)
     std::vector<std::map<std::string, size_t>> var_stack;
+
+    // Template parameter names for the current generic function
+    std::vector<IRType::Param> generic_params;
 
     std::string new_label();
     size_t new_value_id();
@@ -79,6 +85,8 @@ class IRBuilder {
     void lower_decl(const Decl& decl);
     void lower_var_decl(const VariableDecl& decl);
     void lower_fn_decl(const FunctionDecl& decl);
+    void lower_template_decl(const TemplateDecl& decl);
+    size_t lower_template_id(const TemplateIdExpr& expr);
 
 public:
     explicit IRBuilder(IRModule& mod) : module(mod) {}

@@ -17,6 +17,7 @@ private:
     std::vector<ParserToken> tokens;
     size_t pos = 0;
     std::set<std::string> typedef_names;
+    std::set<std::string> template_param_names;
     bool saw_typedef = false;
 
     // Helpers
@@ -45,6 +46,13 @@ private:
     std::unique_ptr<FunctionDecl> parse_function_definition(Type return_type, std::string name);
     std::unique_ptr<VariableDecl> parse_variable_declaration(Type type, std::string name);
     void parse_struct_body(StructDecl* sd);
+
+    // Templates
+    std::unique_ptr<Decl> parse_template_declaration();
+    std::vector<std::unique_ptr<TemplateParamDecl>> parse_template_parameter_list();
+    std::unique_ptr<TemplateParamDecl> parse_template_parameter();
+    std::vector<Type> parse_template_argument_list();
+    bool try_parse_template_id(std::unique_ptr<Expr>& e);
 
     // Statements
     std::unique_ptr<Stmt> parse_statement();

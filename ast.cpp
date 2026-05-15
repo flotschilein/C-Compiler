@@ -33,6 +33,15 @@ static const char* prim_name(PrimitiveKind k) {
 
 static void dump_type(const Type& t) {
     if (t.is_typedef) { std::cout << t.typedef_name; return; }
+    if (t.is_template_type) {
+        std::cout << t.template_name << "<";
+        for (size_t i = 0; i < t.template_args.size(); i++) {
+            if (i) std::cout << ", ";
+            dump_type(t.template_args[i]);
+        }
+        std::cout << ">";
+        return;
+    }
     if (t.is_struct || t.is_union) {
         std::cout << (t.is_struct ? "struct " : "union ") << t.tag_name;
         return;
@@ -81,7 +90,10 @@ Type::Type(const Type& other)
       params(other.params),
       is_pointer(other.is_pointer),
       is_array(other.is_array),
-      array_size(other.array_size)
+      array_size(other.array_size),
+      is_template_type(other.is_template_type),
+      template_name(other.template_name),
+      template_args(other.template_args)
 {
     if (other.return_type) return_type = std::make_unique<Type>(*other.return_type);
     if (other.pointee) pointee = std::make_unique<Type>(*other.pointee);
@@ -106,6 +118,9 @@ Type& Type::operator=(const Type& other) {
     is_pointer = other.is_pointer;
     is_array = other.is_array;
     array_size = other.array_size;
+    is_template_type = other.is_template_type;
+    template_name = other.template_name;
+    template_args = other.template_args;
     return_type = other.return_type ? std::make_unique<Type>(*other.return_type) : nullptr;
     pointee = other.pointee ? std::make_unique<Type>(*other.pointee) : nullptr;
     element_type = other.element_type ? std::make_unique<Type>(*other.element_type) : nullptr;
@@ -191,6 +206,21 @@ void StaticAssertDecl::dump(int indent) const {
 void EmptyDecl::dump(int indent) const {
     print_indent(indent);
     std::cout << "EmptyDecl\n";
+}
+
+void TemplateParamDecl::dump(int indent) const {
+    print_indent(indent);
+    std::cout << "TemplateParam ";
+    if (is_type_param) std::cout << "typename ";
+    else { dump_type(param_type); std::cout << " "; }
+    std::cout << name << "\n";
+}
+
+void TemplateDecl::dump(int indent) const {
+    print_indent(indent);
+    std::cout << "TemplateDecl\n";
+    for (const auto& p : params) p->dump(indent + 1);
+    if (wrapped_decl) wrapped_decl->dump(indent + 1);
 }
 
 void CompoundStmt::dump(int indent) const {
@@ -460,4 +490,18 @@ void InitListExpr::dump(int indent) const {
         if (inits[i]) inits[i]->dump(0);
     }
     std::cout << "}";
+}
+
+void TemplateIdExpr::dump(int indent) const {
+    std::cout << template_name << "<";
+    for (size_t i = 0; i < template_args.size(); i++) {
+        if (i) std::cout << ", ";
+        dump_type(template_args[i]);
+    }
+    std::cout << ">(";
+    for (size_t i = 0; i < call_args.size(); i++) {
+        if (i) std::cout << ", ";
+        if (call_args[i]) call_args[i]->dump(0);
+    }
+    std::cout << ")";
 }

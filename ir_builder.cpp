@@ -5,12 +5,31 @@
 
 // --- Utilities ---
 
+IRFunction* IRBuilder::current_fn() {
+    if (current_fn_idx >= module.functions.size()) return nullptr;
+    return &module.functions[current_fn_idx];
+}
+
+void IRBuilder::set_current_fn(IRFunction* fn) {
+    if (!fn) {
+        current_fn_idx = (size_t)-1;
+        return;
+    }
+    for (size_t i = 0; i < module.functions.size(); i++) {
+        if (&module.functions[i] == fn) {
+            current_fn_idx = i;
+            return;
+        }
+    }
+    current_fn_idx = (size_t)-1;
+}
+
 std::string IRBuilder::new_label() {
     return "L" + std::to_string(next_label_id++);
 }
 
 size_t IRBuilder::new_value_id() {
-    return current_fn->next_value_id++;
+    return current_fn()->next_value_id++;
 }
 
 size_t IRBuilder::emit(Instruction::Opcode op, IRType result_type,
@@ -35,8 +54,8 @@ void IRBuilder::set_block(IRBlock* block) {
 
 IRBlock* IRBuilder::add_block(std::string label) {
     if (label.empty()) label = new_label();
-    current_fn->blocks.push_back({std::move(label)});
-    return &current_fn->blocks.back();
+    current_fn()->blocks.push_back({std::move(label)});
+    return &current_fn()->blocks.back();
 }
 
 size_t IRBuilder::find_var(const std::string& name) {
@@ -88,6 +107,13 @@ IRType IRBuilder::lower_type(const Type& ast_type) {
         }
         return IRTypeFactory::fn(lower_type(*ast_type.return_type), param_types, ast_type.is_variadic);
     }
+    if (ast_type.is_template_type) {
+        // Template type: look up or create struct with args
+        std::vector<IRType> args;
+        for (auto& ta : ast_type.template_args)
+            args.push_back(lower_type(ta));
+        return IRTypeFactory::strukt(ast_type.template_name, args);
+    }
     if (ast_type.is_struct || ast_type.is_union) {
         return IRTypeFactory::strukt(ast_type.tag_name);
     }
@@ -95,9 +121,12 @@ IRType IRBuilder::lower_type(const Type& ast_type) {
         return IRPrimitive::I32; // enums are int-sized
     }
     if (ast_type.is_typedef) {
-        // The semantic analyzer should have resolved this, but just in case:
-        // For now, treat typedef'd types as their underlying prim.
-        // A more complete solution would resolve through the type chain.
+        // Check if this is a template parameter name
+        for (auto& gp : generic_params) {
+            if (gp.name == ast_type.typedef_name) {
+                return IRType::Param{gp.index, gp.name};
+            }
+        }
         return lower_prim(ast_type.prim);
     }
     return lower_prim(ast_type.prim);
@@ -119,6 +148,7 @@ size_t IRBuilder::lower_expr(const Expr& expr) {
     if (auto* e = dynamic_cast<const SubscriptExpr*>(&expr))  return lower_subscript(*e);
     if (auto* e = dynamic_cast<const CommaExpr*>(&expr))      return lower_comma(*e);
     if (auto* e = dynamic_cast<const SizeofExpr*>(&expr))     return lower_sizeof(*e);
+    if (auto* e = dynamic_cast<const TemplateIdExpr*>(&expr)) return lower_template_id(*e);
     if (dynamic_cast<const NullptrExpr*>(&expr)) {
         return emit(Instruction::CONST, IRTypeFactory::ptr(IRPrimitive::VOID), {});
     }
@@ -163,7 +193,16 @@ size_t IRBuilder::lower_expr_addr(const Expr& expr) {
 size_t IRBuilder::lower_constant(const ConstantExpr& expr) {
     IRType type = lower_type(expr.result_type);
     size_t id = emit(Instruction::CONST, type, {});
-    current_block->instructions.back().const_val.int_val = expr.value;
+    if (type.is_prim()) {
+        auto p = type.as_prim();
+        if (p == IRPrimitive::F32 || p == IRPrimitive::F64) {
+            current_block->instructions.back().const_val.float_val = std::stod(expr.raw_value);
+        } else {
+            current_block->instructions.back().const_val.int_val = expr.value;
+        }
+    } else {
+        current_block->instructions.back().const_val.int_val = expr.value;
+    }
     return id;
 }
 
@@ -881,6 +920,7 @@ void IRBuilder::lower_decl_stmt(const DeclStmt& stmt) {
 void IRBuilder::lower_decl(const Decl& decl) {
     if (auto* d = dynamic_cast<const VariableDecl*>(&decl)) return lower_var_decl(*d);
     if (auto* d = dynamic_cast<const FunctionDecl*>(&decl)) return lower_fn_decl(*d);
+    if (auto* d = dynamic_cast<const TemplateDecl*>(&decl)) return lower_template_decl(*d);
     // Skip other decl types (typedef, struct, etc.)
 }
 
@@ -918,22 +958,24 @@ void IRBuilder::lower_fn_decl(const FunctionDecl& decl) {
 
     fn.is_defined = decl.body != nullptr;
     fn.next_value_id = fn.params.size(); // params are value IDs 0..N-1
-    current_fn = &module.functions.emplace_back(std::move(fn));
-    current_fn->blocks.clear();
+    current_fn_idx = module.functions.size();
+    module.functions.push_back(std::move(fn));
 
     if (!decl.body) {
-        current_fn = nullptr;
+        set_current_fn(nullptr);
         current_block = nullptr;
         return;
     }
+
+    current_fn()->blocks.clear();
 
     // Entry block
     auto* entry = add_block("entry");
     set_block(entry);
 
     // Alloca for each param and store the incoming SSA value
-    for (size_t i = 0; i < current_fn->params.size(); i++) {
-        auto& [type, name] = current_fn->params[i];
+    for (size_t i = 0; i < current_fn()->params.size(); i++) {
+        auto& [type, name] = current_fn()->params[i];
         size_t alloca_id = emit(Instruction::ALLOCA, IRTypeFactory::ptr(type), {});
         current_block->instructions.back().extra_type = type.copy();
         emit(Instruction::STORE, IRPrimitive::VOID, {i, alloca_id});
@@ -960,16 +1002,112 @@ void IRBuilder::lower_fn_decl(const FunctionDecl& decl) {
     }
 
     // Pop param allocas
-    for (size_t i = 0; i < current_fn->params.size(); i++)
+    for (size_t i = 0; i < current_fn()->params.size(); i++)
         var_stack.pop_back();
 
-    current_fn = nullptr;
+    set_current_fn(nullptr);
     current_block = nullptr;
+}
+
+// --- Template Lowering ---
+
+void IRBuilder::lower_template_decl(const TemplateDecl& decl) {
+    // If the wrapped declaration is a function, populate type_params
+    if (auto* fd = dynamic_cast<const FunctionDecl*>(decl.wrapped_decl.get())) {
+        // Set generic params before lowering so lower_type can resolve them
+        generic_params.clear();
+        size_t idx = 0;
+        for (auto& tp : decl.params) {
+            if (tp->is_type_param) {
+                generic_params.push_back(IRType::Param{idx, tp->name});
+                idx++;
+            }
+        }
+
+        // Lower the function body (parameter and return types will use generic_params)
+        lower_fn_decl(*fd);
+
+        // Set type_params on the generated function
+        for (auto& fn : module.functions) {
+            if (fn.name == fd->name) {
+                fn.type_params = generic_params;
+                break;
+            }
+        }
+
+        generic_params.clear();
+    } else if (auto* sd = dynamic_cast<const StructDecl*>(decl.wrapped_decl.get())) {
+        // For struct templates, add to module structs with type_params
+        IRStructDef sdef;
+        sdef.name = sd->name;
+        sdef.is_defined = true;
+        size_t idx = 0;
+        for (auto& tp : decl.params) {
+            if (tp->is_type_param) {
+                sdef.type_params.push_back(IRType::Param{idx, tp->name});
+                idx++;
+            }
+        }
+        // Lower fields
+        for (auto& f : sd->fields) {
+            if (auto* fd = dynamic_cast<FieldDecl*>(f.get())) {
+                IRType ft = lower_type(fd->field_type);
+                sdef.fields.push_back({std::move(ft), fd->name});
+            }
+        }
+        module.structs.push_back(std::move(sdef));
+    }
+    // Other template-wrapped decls: skip for now
+}
+
+size_t IRBuilder::lower_template_id(const TemplateIdExpr& expr) {
+    // Lower the call arguments
+    std::vector<size_t> arg_ids;
+    for (auto& arg : expr.call_args)
+        arg_ids.push_back(lower_expr(*arg));
+
+    // Get the concrete types for the template args
+    std::vector<IRType> type_args;
+    for (auto& ta : expr.template_args)
+        type_args.push_back(lower_type(ta));
+
+    // Find the generic function in the module
+    IRFunction* generic_fn = module.find_function(expr.template_name);
+    if (!generic_fn || !generic_fn->is_generic()) {
+        size_t id = emit(Instruction::CALL, lower_type(expr.result_type), arg_ids);
+        current_block->instructions.back().callee_name = expr.template_name;
+        return id;
+    }
+
+    // Instantiate the generic function
+    size_t old_fn_count = module.functions.size();
+    IRInstantiator inst;
+    IRCache cache;
+    IRFunction* concrete = cache.get_or_instantiate(inst, module,
+                                                     expr.template_name, type_args);
+
+    // Re-acquire current_fn (vector may have reallocated)
+    if (old_fn_count < module.functions.size() && current_fn_idx != (size_t)-1) {
+        // current_fn_idx is still valid index (vector reallocation doesn't change indices)
+        // But current_block pointer may still be valid since blocks are stable
+    }
+
+    if (concrete) {
+        size_t id = emit(Instruction::CALL, lower_type(expr.result_type), arg_ids);
+        current_block->instructions.back().callee_name = concrete->name;
+        return id;
+    }
+
+    size_t id = emit(Instruction::CALL, lower_type(expr.result_type), arg_ids);
+    current_block->instructions.back().callee_name = expr.template_name;
+    return id;
 }
 
 // --- Entry Point ---
 
 void IRBuilder::lower_translation_unit(const TranslationUnit& tu) {
+    // Pre-allocate space to reduce pointer invalidation
+    module.functions.reserve(tu.decls.size() * 2);
     for (auto& decl : tu.decls)
         lower_decl(*decl);
 }

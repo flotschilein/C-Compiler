@@ -408,6 +408,9 @@ std::unique_ptr<Expr> Parser::parse_unary_expression() {
 std::unique_ptr<Expr> Parser::parse_postfix_expression() {
     auto e = parse_primary_expression();
 
+    // Try template-id: name<type, type>(args)
+    try_parse_template_id(e);
+
     while (true) {
         if (peek().kind == TokenKind::LBRACKET) {
             consume();
@@ -689,6 +692,35 @@ Type Parser::parse_declaration_specifiers(bool allow_typedef) {
                 t.is_typedef = true;
                 t.typedef_name = peek(-1).value;
                 has_type = true;
+                goto done;
+            }
+            case TokenKind::IDENTIFIER: {
+                std::string id_val = peek().value;
+                // Check if this is a template param type name: T
+                if (template_param_names.count(id_val)) {
+                    consume();
+                    t.is_typedef = true;
+                    t.typedef_name = id_val;
+                    has_type = true;
+                    goto done;
+                }
+                // Check if this is a template type: name<type, ...>
+                if (peek(1).kind == TokenKind::LT) {
+                    std::string tname = consume().value;
+                    consume(); // '<'
+                    std::vector<Type> targs;
+                    while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+                        targs.push_back(parse_type_name());
+                        if (peek().kind == TokenKind::COMMA) consume();
+                        else if (peek().kind == TokenKind::GT) break;
+                    }
+                    expect(TokenKind::GT, "expected '>' in template type");
+                    t.is_template_type = true;
+                    t.template_name = tname;
+                    t.template_args = std::move(targs);
+                    has_type = true;
+                    goto done;
+                }
                 goto done;
             }
             default:
@@ -1016,6 +1048,11 @@ Type Parser::parse_type_name() {
 // ==================== Declaration Parsing ====================
 
 std::unique_ptr<Decl> Parser::parse_declaration() {
+    // Handle template declaration
+    if (peek().kind == TokenKind::KW_TEMPLATE) {
+        return parse_template_declaration();
+    }
+
     // Handle static_assert
     if (peek().kind == TokenKind::KW__STATIC_ASSERT || peek().kind == TokenKind::KW_STATIC_ASSERT) {
         consume();
@@ -1161,6 +1198,132 @@ void Parser::parse_struct_body(StructDecl* sd) {
     // already handled in parse_struct_or_union_specifier
 }
 
+// ==================== Template Parsing ====================
+
+std::unique_ptr<TemplateParamDecl> Parser::parse_template_parameter() {
+    auto tp = std::make_unique<TemplateParamDecl>();
+    if (peek().kind == TokenKind::KW_TYPENAME || peek().kind == TokenKind::KW_CLASS) {
+        consume();
+        tp->is_type_param = true;
+        tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
+    } else {
+        tp->is_type_param = false;
+        tp->param_type = parse_type();
+        tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
+    }
+    return tp;
+}
+
+std::vector<std::unique_ptr<TemplateParamDecl>> Parser::parse_template_parameter_list() {
+    std::vector<std::unique_ptr<TemplateParamDecl>> params;
+    expect(TokenKind::LT, "expected '<' after template");
+    while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+        params.push_back(parse_template_parameter());
+        if (peek().kind == TokenKind::COMMA) consume();
+        else if (peek().kind == TokenKind::GT) break;
+        // Handle >> for nested templates (not yet)
+    }
+    expect(TokenKind::GT, "expected '>' in template parameter list");
+    return params;
+}
+
+std::unique_ptr<Decl> Parser::parse_template_declaration() {
+    consume(); // 'template'
+    auto params = parse_template_parameter_list();
+
+    // Register template parameter names as type names for parsing the body
+    for (auto& p : params) {
+        if (p->is_type_param) {
+            template_param_names.insert(p->name);
+        }
+    }
+
+    auto td = std::make_unique<TemplateDecl>();
+    td->params = std::move(params);
+
+    // The wrapped declaration is parsed as a regular declaration
+    auto inner = parse_declaration();
+    td->wrapped_decl = std::move(inner);
+
+    // Clean up template param names
+    for (auto& p : td->params) {
+        if (p->is_type_param) {
+            template_param_names.erase(p->name);
+        }
+    }
+
+    return td;
+}
+
+std::vector<Type> Parser::parse_template_argument_list() {
+    std::vector<Type> args;
+    expect(TokenKind::LT, "expected '<' for template arguments");
+    while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+        args.push_back(parse_type_name());
+        if (peek().kind == TokenKind::COMMA) consume();
+        else if (peek().kind == TokenKind::GT) break;
+    }
+    expect(TokenKind::GT, "expected '>' in template argument list");
+    return args;
+}
+
+bool Parser::try_parse_template_id(std::unique_ptr<Expr>& e) {
+    if (peek().kind != TokenKind::LT) return false;
+
+    auto* id_expr = dynamic_cast<IdentifierExpr*>(e.get());
+    if (!id_expr) return false;
+
+    // Only attempt if name is a known template or if next token looks like a type
+    auto k1 = peek(1).kind;
+    bool looks_like_template = (k1 == TokenKind::KW_VOID || k1 == TokenKind::KW_CHAR ||
+        k1 == TokenKind::KW_SHORT || k1 == TokenKind::KW_INT ||
+        k1 == TokenKind::KW_LONG || k1 == TokenKind::KW_FLOAT ||
+        k1 == TokenKind::KW_DOUBLE || k1 == TokenKind::KW_SIGNED ||
+        k1 == TokenKind::KW_UNSIGNED || k1 == TokenKind::KW__BOOL ||
+        k1 == TokenKind::KW__COMPLEX || k1 == TokenKind::KW_CONST ||
+        k1 == TokenKind::KW_VOLATILE || k1 == TokenKind::KW_STRUCT ||
+        k1 == TokenKind::KW_UNION || k1 == TokenKind::KW_ENUM ||
+        k1 == TokenKind::KW_TYPEOF || k1 == TokenKind::KW_TYPEOF_UNQUAL ||
+        k1 == TokenKind::TYPE_NAME);
+    if (!looks_like_template) return false;
+
+    std::string name = id_expr->name;
+
+    size_t saved = pos;
+    try {
+        consume(); // '<'
+        std::vector<Type> args;
+        while (peek().kind != TokenKind::GT && peek().kind != TokenKind::END_OF_FILE) {
+            size_t before = pos;
+            args.push_back(parse_type_name());
+            // Guard against infinite loop if type parsing doesn't advance
+            if (pos == before) { consume(); break; }
+            if (peek().kind == TokenKind::COMMA) consume();
+            else if (peek().kind == TokenKind::GT) break;
+        }
+        expect(TokenKind::GT, "expected '>' in template argument list");
+
+        auto tie = std::make_unique<TemplateIdExpr>();
+        tie->template_name = name;
+        tie->template_args = std::move(args);
+
+        if (peek().kind == TokenKind::LPAREN) {
+            consume();
+            while (peek().kind != TokenKind::RPAREN && peek().kind != TokenKind::END_OF_FILE) {
+                tie->call_args.push_back(parse_assignment_expression());
+                if (peek().kind == TokenKind::COMMA) consume();
+            }
+            expect(TokenKind::RPAREN, "expected ')' after template function call");
+        }
+
+        e = std::move(tie);
+        return true;
+    } catch (...) {
+        pos = saved;
+        return false;
+    }
+}
+
 // ==================== Statement Parsing ====================
 
 std::unique_ptr<Stmt> Parser::parse_statement() {
@@ -1216,7 +1379,9 @@ std::unique_ptr<Stmt> Parser::parse_statement() {
             return std::make_unique<NullStmt>();
         }
         default: {
-            if (is_type_specifier(peek().kind)) {
+            if (is_type_specifier(peek().kind) ||
+                (peek().kind == TokenKind::IDENTIFIER &&
+                 template_param_names.count(peek().value))) {
                 auto ds = std::make_unique<DeclStmt>();
                 ds->decl = parse_declaration();
                 ds->loc = ds->decl->loc;
@@ -1294,7 +1459,9 @@ std::unique_ptr<Stmt> Parser::parse_for_statement() {
     // Init clause
     if (peek().kind == TokenKind::SEMICOLON) {
         consume();
-    } else if (is_type_specifier(peek().kind)) {
+    } else if (is_type_specifier(peek().kind) ||
+               (peek().kind == TokenKind::IDENTIFIER &&
+                template_param_names.count(peek().value))) {
         auto ds = std::make_unique<DeclStmt>();
         ds->decl = parse_declaration();
         fs->init = std::move(ds);

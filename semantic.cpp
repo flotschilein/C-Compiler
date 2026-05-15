@@ -57,7 +57,10 @@ void SemanticAnalyzer::note(const std::string& msg, const SourceLoc& loc) const 
 }
 
 bool SemanticAnalyzer::is_integer(const Type& t) const {
-    if (t.is_typedef) return is_integer(t); // handled via lookup
+    if (t.is_typedef) {
+        if (template_param_names.count(t.typedef_name)) return true; // template param, be permissive
+        return true; // treat other typedefs as integer for now
+    }
     if (t.is_pointer || t.is_array || t.is_function) return false;
     if (t.is_struct || t.is_union || t.is_enum) return t.is_enum;
     switch (t.prim) {
@@ -76,15 +79,20 @@ bool SemanticAnalyzer::is_integer(const Type& t) const {
 }
 
 bool SemanticAnalyzer::is_arithmetic(const Type& t) const {
-    if (t.is_typedef) return is_arithmetic(t);
+    if (t.is_typedef) {
+        if (template_param_names.count(t.typedef_name)) return true;
+        return true;
+    }
     if (t.is_pointer || t.is_array || t.is_function) return false;
     if (t.is_struct || t.is_union) return false;
     if (t.is_enum) return true;
-    return true; // all primitives are arithmetic (void is not really, but we filter in ops)
+    return true;
 }
 
 bool SemanticAnalyzer::is_scalar(const Type& t) const {
-    if (t.is_typedef) return is_scalar(t);
+    if (t.is_typedef) {
+        return true; // template param or typedef, treat as scalar
+    }
     if (t.is_pointer || t.is_array) return true;
     if (t.is_function) return false;
     if (t.is_struct || t.is_union) return false;
@@ -94,7 +102,10 @@ bool SemanticAnalyzer::is_scalar(const Type& t) const {
 
 int SemanticAnalyzer::type_rank(const Type& t) const {
     // C type rank for usual arithmetic conversions
-    if (t.is_typedef) return type_rank(t);
+    if (t.is_typedef) {
+        if (template_param_names.count(t.typedef_name)) return 4; // int rank for template params
+        return 4;
+    }
     if (t.is_enum) return 11;
     if (t.is_pointer || t.is_array) return 20;
     switch (t.prim) {
@@ -121,7 +132,12 @@ int SemanticAnalyzer::type_rank(const Type& t) const {
 }
 
 bool SemanticAnalyzer::types_equal(const Type& a, const Type& b) const {
-    if (a.is_typedef || b.is_typedef) return &a == &b; // pointer comparison for typedefs
+    if (a.is_typedef || b.is_typedef) {
+        // Template params of the same name are equal
+        if (a.is_typedef && b.is_typedef && a.typedef_name == b.typedef_name)
+            return true;
+        return &a == &b;
+    }
     if (a.is_pointer && b.is_pointer) return types_equal(*a.pointee, *b.pointee);
     if (a.is_array && b.is_array) return types_equal(*a.element_type, *b.element_type);
     if (a.is_function && b.is_function) {
@@ -161,6 +177,8 @@ void SemanticAnalyzer::visit_decl(Decl& d) {
         visit_enum(*ed);
     } else if (auto* sa = dynamic_cast<StaticAssertDecl*>(&d)) {
         visit_static_assert(*sa);
+    } else if (auto* tpd = dynamic_cast<TemplateDecl*>(&d)) {
+        visit_template_decl(*tpd);
     }
     // EmptyDecl: nothing to do
 }
@@ -286,6 +304,50 @@ void SemanticAnalyzer::visit_enum(EnumDecl& d) {
 void SemanticAnalyzer::visit_static_assert(StaticAssertDecl& d) {
     if (d.condition) {
         visit_expr(*d.condition);
+    }
+}
+
+void SemanticAnalyzer::visit_template_decl(TemplateDecl& d) {
+    // Register template param names for type checking
+    for (auto& p : d.params) {
+        if (p->is_type_param) {
+            template_param_names.insert(p->name);
+        }
+    }
+
+    // Register the template in the symbol table
+    std::string name;
+    if (auto* fd = dynamic_cast<FunctionDecl*>(d.wrapped_decl.get())) {
+        name = fd->name;
+    } else if (auto* sd = dynamic_cast<StructDecl*>(d.wrapped_decl.get())) {
+        name = sd->name;
+    } else if (auto* vd = dynamic_cast<VariableDecl*>(d.wrapped_decl.get())) {
+        name = vd->name;
+    }
+
+    if (!name.empty()) {
+        Symbol s;
+        s.name = name;
+        s.kind = Symbol::TEMPLATE;
+        for (auto& p : d.params) {
+            Type pt;
+            pt.prim = PrimitiveKind::INT;
+            pt.is_typedef = true;
+            pt.typedef_name = p->name;
+            s.template_param_types.push_back(std::move(pt));
+        }
+        symtab.add(s);
+    }
+
+    // Also analyze the inner declaration (visit function body, etc.)
+    if (d.wrapped_decl)
+        visit_decl(*d.wrapped_decl);
+
+    // Clean up
+    for (auto& p : d.params) {
+        if (p->is_type_param) {
+            template_param_names.erase(p->name);
+        }
     }
 }
 
@@ -495,6 +557,8 @@ Type SemanticAnalyzer::visit_expr(Expr& e) {
         result = visit_compound_literal(*cle);
     } else if (auto* ile = dynamic_cast<InitListExpr*>(&e)) {
         result = visit_init_list(*ile);
+    } else if (auto* tie = dynamic_cast<TemplateIdExpr*>(&e)) {
+        result = visit_template_id(*tie);
     }
 
     e.result_type = result;
@@ -834,4 +898,24 @@ Type SemanticAnalyzer::visit_init_list(InitListExpr& e) {
     t.element_type = std::make_unique<Type>();
     t.element_type->prim = PrimitiveKind::INT;
     return t;
+}
+
+Type SemanticAnalyzer::visit_template_id(TemplateIdExpr& e) {
+    Symbol* s = symtab.lookup(e.template_name);
+    if (!s || s->kind != Symbol::TEMPLATE) {
+        error("unknown template '" + e.template_name + "'", e.loc);
+        return Type{};
+    }
+
+    // Analyze call arguments so their result_type is set
+    for (auto& arg : e.call_args) {
+        if (arg) visit_expr(*arg);
+    }
+
+    // Use the first template argument as the return type (common case: T fn(T, T))
+    if (!e.template_args.empty()) {
+        return e.template_args[0];
+    }
+
+    return Type{};
 }

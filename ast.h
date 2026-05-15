@@ -64,6 +64,11 @@ struct Type {
     // typeof
     std::unique_ptr<Type> typeof_expr;
 
+    // template type (e.g. `Vector<int>`)
+    bool is_template_type = false;
+    std::string template_name;
+    std::vector<Type> template_args;
+
     Type() = default;
     Type(const Type& other);
     Type& operator=(const Type& other);
@@ -151,6 +156,21 @@ struct StaticAssertDecl : Decl {
 };
 
 struct EmptyDecl : Decl {
+    void dump(int indent = 0) const override;
+};
+
+// --- Template ---
+
+struct TemplateParamDecl : Decl {
+    bool is_type_param = true;  // true: "typename T", false: "int N"
+    Type param_type;            // for non-type params (e.g. int)
+    std::string name;           // "T", "N"
+    void dump(int indent = 0) const override;
+};
+
+struct TemplateDecl : Decl {
+    std::vector<std::unique_ptr<TemplateParamDecl>> params;
+    std::unique_ptr<Decl> wrapped_decl;  // FunctionDecl, StructDecl, etc.
     void dump(int indent = 0) const override;
 };
 
@@ -374,6 +394,13 @@ struct CompoundLiteralExpr : Expr {
 
 struct InitListExpr : Expr {
     std::vector<std::unique_ptr<Expr>> inits;
+    void dump(int indent = 0) const override;
+};
+
+struct TemplateIdExpr : Expr {
+    std::string template_name;
+    std::vector<Type> template_args;
+    std::vector<std::unique_ptr<Expr>> call_args;  // function call args (if any)
     void dump(int indent = 0) const override;
 };
 

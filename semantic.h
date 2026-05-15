@@ -4,18 +4,21 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <memory>
 #include "ast.h"
 
 struct Symbol {
     std::string name;
     Type type;
-    enum Kind { VARIABLE, FUNCTION, TYPEDEF, ENUM_CONST, TAG_STRUCT, TAG_UNION, TAG_ENUM };
+    enum Kind { VARIABLE, FUNCTION, TYPEDEF, ENUM_CONST, TAG_STRUCT, TAG_UNION, TAG_ENUM, TEMPLATE };
     Kind kind;
     int scope_level = 0;
     long long enum_value = 0;
     bool is_defined = false;
     bool is_parameter = false;
+    // Template info
+    std::vector<Type> template_param_types;  // for TEMPLATE kind symbols
 };
 
 class SymbolTable {
@@ -41,6 +44,7 @@ private:
     Type current_return_type;
     int loop_depth = 0;
     int switch_depth = 0;
+    std::set<std::string> template_param_names;
 
     // Declarations
     void visit_decl(Decl& d);
@@ -50,6 +54,7 @@ private:
     void visit_struct(StructDecl& d);
     void visit_enum(EnumDecl& d);
     void visit_static_assert(StaticAssertDecl& d);
+    void visit_template_decl(TemplateDecl& d);
 
     // Statements
     void visit_stmt(Stmt& s);
@@ -88,6 +93,7 @@ private:
     Type visit_nullptr(NullptrExpr& e);
     Type visit_compound_literal(CompoundLiteralExpr& e);
     Type visit_init_list(InitListExpr& e);
+    Type visit_template_id(TemplateIdExpr& e);
 
     // Helpers
     bool is_arithmetic(const Type& t) const;
