@@ -5,6 +5,10 @@
 #include "token.h"
 #include "parser.h"
 #include "semantic.h"
+#include "ir.h"
+#include "ir_builder.h"
+#include "ir_printer.h"
+#include "ir_instantiator.h"
 
 int main(int ac, char* av[]) {
     if (ac == 1) {
@@ -33,6 +37,14 @@ int main(int ac, char* av[]) {
             std::cout << "--- Semantic Analysis ---\n";
             SemanticAnalyzer analyzer;
             analyzer.analyze(*ast);
+
+            // IR Generation
+            std::cout << "--- GIR ---\n";
+            IRModule mod;
+            IRBuilder builder(mod);
+            builder.lower_translation_unit(*ast);
+            std::cout << IRPrinter::print_module(mod);
+
             std::cout << "--- Done ---\n";
         } catch (const std::exception& e) {
             std::cerr << "Error: " << e.what() << std::endl;

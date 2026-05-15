@@ -16,4 +16,9 @@ add_executable(C_Compiler
         parser.cpp
         parser.h
         semantic.cpp
-        semantic.h)
+        semantic.h
+        ir_type.h ir_type.cpp
+        ir.h ir.cpp
+        ir_printer.h ir_printer.cpp
+        ir_builder.h ir_builder.cpp
+        ir_instantiator.h ir_instantiator.cpp)
