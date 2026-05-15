@@ -85,10 +85,6 @@ private:
     std::vector<Token> expand_function_like(Macro& m, std::vector<std::vector<Token>>& args,
                                               std::set<std::string>& expanding);
 
-    std::vector<Token> tokenize(const std::string& source, const std::string& filename);
-    std::string read_file(const std::string& filename);
-    std::string phase1_2(const std::string& source);
-    
     std::map<std::string, Macro> macros;
     std::vector<std::string> include_paths;
     std::set<std::string> once_files;

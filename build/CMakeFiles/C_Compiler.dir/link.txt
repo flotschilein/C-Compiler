@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/C_Compiler.dir/main.cpp.o CMakeFiles/C_Compiler.dir/preprocessor.cpp.o CMakeFiles/C_Compiler.dir/lexer.cpp.o CMakeFiles/C_Compiler.dir/token.cpp.o CMakeFiles/C_Compiler.dir/ast.cpp.o CMakeFiles/C_Compiler.dir/parser.cpp.o CMakeFiles/C_Compiler.dir/semantic.cpp.o -o C_Compiler 
