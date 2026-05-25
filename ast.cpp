@@ -49,6 +49,9 @@ static void dump_type(const Type& t) {
     if (t.is_enum) { std::cout << "enum " << t.tag_name; return; }
     if (t.is_const) std::cout << "const ";
     if (t.is_volatile) std::cout << "volatile ";
+    if (t.is_restrict) std::cout << "restrict ";
+    if (t.is_atomic) std::cout << "_Atomic ";
+    if (t.is_complex) std::cout << "_Complex ";
     if (t.is_function) {
         std::cout << "function(";
         for (size_t i = 0; i < t.params.size(); i++) {
@@ -78,6 +81,8 @@ static void dump_type(const Type& t) {
 Type::Type(const Type& other)
     : prim(other.prim),
       is_const(other.is_const), is_volatile(other.is_volatile),
+      is_restrict(other.is_restrict), is_atomic(other.is_atomic),
+      is_complex(other.is_complex),
       is_signed(other.is_signed), is_unsigned(other.is_unsigned),
       is_typedef(other.is_typedef), typedef_name(other.typedef_name),
       is_struct(other.is_struct), is_union(other.is_union),
@@ -105,6 +110,7 @@ Type& Type::operator=(const Type& other) {
     if (this == &other) return *this;
     prim = other.prim;
     is_const = other.is_const; is_volatile = other.is_volatile;
+    is_restrict = other.is_restrict; is_atomic = other.is_atomic; is_complex = other.is_complex;
     is_signed = other.is_signed; is_unsigned = other.is_unsigned;
     is_typedef = other.is_typedef; typedef_name = other.typedef_name;
     is_struct = other.is_struct; is_union = other.is_union;
@@ -211,9 +217,10 @@ void EmptyDecl::dump(int indent) const {
 void TemplateParamDecl::dump(int indent) const {
     print_indent(indent);
     std::cout << "TemplateParam ";
-    if (is_type_param) std::cout << "typename ";
-    else { dump_type(param_type); std::cout << " "; }
-    std::cout << name << "\n";
+    if (is_type_param) std::cout << "typename";
+    else { dump_type(param_type); }
+    if (is_variadic) std::cout << "...";
+    std::cout << " " << name << "\n";
 }
 
 void TemplateDecl::dump(int indent) const {

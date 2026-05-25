@@ -45,7 +45,7 @@ private:
     int loop_depth = 0;
     int switch_depth = 0;
     std::set<std::string> template_param_names;
-    std::map<std::string, std::vector<std::pair<Type, std::string>>> struct_defs;
+    std::map<std::string, std::vector<std::tuple<Type, std::string, long long>>> struct_defs;
 
     // Declarations
     void visit_decl(Decl& d);
@@ -98,6 +98,8 @@ private:
 
     // Helpers
     void resolve_struct_type(Type& t);
+    void resolve_type(Type& t);
+    long long eval_constant_expr(Expr& e);
 
     // Helpers
     bool is_arithmetic(const Type& t) const;

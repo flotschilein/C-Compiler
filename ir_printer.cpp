@@ -414,6 +414,16 @@ std::string IRPrinter::print_module(const IRModule& mod) {
         os << "}\n\n";
     }
 
+    // Print global variables
+    for (auto& g : mod.globals) {
+        os << "global @" << g.name << " : " << type_to_string(g.type);
+        if (g.is_static) os << " static";
+        if (g.is_extern) os << " extern";
+        if (g.has_init) os << " = " << g.init_val;
+        os << "\n";
+    }
+    if (!mod.globals.empty()) os << "\n";
+
     // Print global strings
     for (auto& s : mod.global_strings) {
         os << "global_string \"" << s << "\"\n";

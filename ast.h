@@ -29,6 +29,9 @@ struct Type {
     PrimitiveKind prim = PrimitiveKind::INT;
     bool is_const = false;
     bool is_volatile = false;
+    bool is_restrict = false;
+    bool is_atomic = false;
+    bool is_complex = false;
     bool is_signed = true;
     bool is_unsigned = false;
     bool is_typedef = false;
@@ -39,9 +42,9 @@ struct Type {
     std::string tag_name;
     bool is_incomplete = false;
 
-    // struct/union members
+    // struct/union members (tuple<Type, name, bitfield_size>; bitfield_size=-1 means not a bitfield)
     bool has_members = false;
-    std::vector<std::pair<Type, std::string>> members;
+    std::vector<std::tuple<Type, std::string, long long>> members;
 
     // enum
     std::vector<std::pair<std::string, long long>> enumerators;
@@ -163,6 +166,7 @@ struct EmptyDecl : Decl {
 
 struct TemplateParamDecl : Decl {
     bool is_type_param = true;  // true: "typename T", false: "int N"
+    bool is_variadic = false;   // true: "typename... Args"
     Type param_type;            // for non-type params (e.g. int)
     std::string name;           // "T", "N"
     void dump(int indent = 0) const override;

@@ -611,7 +611,12 @@ Type Parser::parse_declaration_specifiers(bool allow_typedef) {
 
     bool has_type = false;
     bool has_signedness = false;
+    bool saw_complex = false;
     saw_typedef = false;
+    saw_static = false;
+    saw_extern = false;
+    saw_thread_local = false;
+    saw_constexpr = false;
 
     while (true) {
         auto k = peek().kind;
@@ -643,19 +648,24 @@ Type Parser::parse_declaration_specifiers(bool allow_typedef) {
             case TokenKind::KW__BOOL:
                 consume(); t.prim = PrimitiveKind::BOOL; has_type = true; break;
             case TokenKind::KW__COMPLEX:
-                consume(); has_type = true; break;
+                consume(); saw_complex = true; has_type = true; break;
             case TokenKind::KW_CONST:
                 consume(); t.is_const = true; break;
             case TokenKind::KW_VOLATILE:
                 consume(); t.is_volatile = true; break;
+            case TokenKind::KW__ATOMIC:
+                consume(); t.is_atomic = true; break;
             case TokenKind::KW_CONSTEXPR:
-                consume(); break; // handled at decl level
+                consume(); saw_constexpr = true; break;
             case TokenKind::KW_EXTERN:
+                consume(); saw_extern = true; break;
             case TokenKind::KW_STATIC:
+                consume(); saw_static = true; break;
             case TokenKind::KW__THREAD_LOCAL:
+                consume(); saw_thread_local = true; break;
             case TokenKind::KW_AUTO:
             case TokenKind::KW_REGISTER:
-                consume(); break; // storage class handled at decl level
+                consume(); break; // ignored
             case TokenKind::KW_INLINE:
             case TokenKind::KW__NORETURN:
                 consume(); break;
@@ -741,6 +751,17 @@ Type Parser::parse_declaration_specifiers(bool allow_typedef) {
         }
     }
     done:
+    // Apply _Complex to the base type
+    if (saw_complex) {
+        t.is_complex = true;
+        switch (t.prim) {
+            case PrimitiveKind::FLOAT:       t.prim = PrimitiveKind::COMPLEX_FLOAT; break;
+            case PrimitiveKind::DOUBLE:      t.prim = PrimitiveKind::COMPLEX_DOUBLE; break;
+            case PrimitiveKind::LONGDOUBLE:  t.prim = PrimitiveKind::COMPLEX_LONGDOUBLE; break;
+            default:                         t.prim = PrimitiveKind::COMPLEX_DOUBLE; break;
+        }
+    }
+
     // Adjust signedness defaults
     if (!has_signedness) {
         switch (t.prim) {
@@ -809,15 +830,14 @@ Type Parser::parse_struct_or_union_specifier() {
                 }
                 field_type = parse_declarator(field_type, fname);
 
-                // Bitfield
+                long long bf_size = -1;
                 if (peek().kind == TokenKind::COLON) {
                     consume();
                     auto bits = parse_cast_expression();
-                    // store bitfield size in field decl
-                    (void)bits;
+                    if (auto* ce = dynamic_cast<ConstantExpr*>(bits.get()))
+                        bf_size = ce->value;
                 }
-
-                t.members.push_back({field_type, fname});
+                t.members.push_back(std::make_tuple(field_type, fname, bf_size));
                 if (peek().kind == TokenKind::COMMA) consume();
             }
             expect(TokenKind::SEMICOLON, "expected ';' in struct/union member");
@@ -874,6 +894,7 @@ Type Parser::parse_declarator(Type base, std::string& name) {
                peek().kind == TokenKind::KW_RESTRICT) {
             if (peek().kind == TokenKind::KW_CONST) ptr.is_const = true;
             if (peek().kind == TokenKind::KW_VOLATILE) ptr.is_volatile = true;
+            if (peek().kind == TokenKind::KW_RESTRICT) ptr.is_restrict = true;
             consume();
         }
         t = ptr;
@@ -1093,8 +1114,14 @@ std::unique_ptr<Decl> Parser::parse_declaration() {
             sd->is_union = t.is_union;
             for (auto& m : t.members) {
                 auto fd = std::make_unique<FieldDecl>();
-                fd->field_type = std::move(m.first);
-                fd->name = std::move(m.second);
+                fd->field_type = std::move(std::get<0>(m));
+                fd->name = std::move(std::get<1>(m));
+                long long bf = std::get<2>(m);
+                if (bf >= 0) {
+                    fd->bitfield_size = std::make_unique<ConstantExpr>();
+                    static_cast<ConstantExpr*>(fd->bitfield_size.get())->value = bf;
+                    static_cast<ConstantExpr*>(fd->bitfield_size.get())->raw_value = std::to_string(bf);
+                }
                 sd->fields.push_back(std::move(fd));
             }
             return sd;
@@ -1152,6 +1179,10 @@ std::unique_ptr<Decl> Parser::parse_declaration() {
             vd->var_type = std::move(dtype);
             vd->name = std::move(name);
             vd->init = std::move(init);
+            vd->is_static = saw_static;
+            vd->is_extern = saw_extern;
+            vd->is_thread_local = saw_thread_local;
+            vd->is_constexpr = saw_constexpr;
             decls.push_back(std::move(vd));
         }
 
@@ -1217,11 +1248,24 @@ std::unique_ptr<TemplateParamDecl> Parser::parse_template_parameter() {
     auto tp = std::make_unique<TemplateParamDecl>();
     if (peek().kind == TokenKind::KW_TYPENAME || peek().kind == TokenKind::KW_CLASS) {
         consume();
-        tp->is_type_param = true;
-        tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
+        // Variadic template: typename... Args
+        if (peek().kind == TokenKind::ELLIPSIS) {
+            consume();
+            tp->is_type_param = true;
+            tp->is_variadic = true;
+            tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
+        } else {
+            tp->is_type_param = true;
+            tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
+        }
     } else {
         tp->is_type_param = false;
+        // Check for variadic non-type: type ... name
         tp->param_type = parse_type();
+        if (peek().kind == TokenKind::ELLIPSIS) {
+            consume();
+            tp->is_variadic = true;
+        }
         tp->name = expect(TokenKind::IDENTIFIER, "expected template parameter name").value;
     }
     return tp;

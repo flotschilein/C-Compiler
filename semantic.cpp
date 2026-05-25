@@ -231,8 +231,98 @@ void SemanticAnalyzer::visit_func(FunctionDecl& d) {
     current_return_type = Type();
 }
 
+// Substitute template type parameters with concrete types
+static Type subst_template_type(const Type& t,
+                                 const std::vector<std::string>& param_names,
+                                 const std::vector<Type>& param_types) {
+    Type result = t;
+    if (result.is_typedef) {
+        for (size_t i = 0; i < param_names.size() && i < param_types.size(); i++) {
+            if (result.typedef_name == param_names[i]) {
+                return param_types[i];
+            }
+        }
+    }
+    if (result.is_pointer && result.pointee) {
+        result.pointee = std::make_unique<Type>(subst_template_type(*result.pointee, param_names, param_types));
+    }
+    if (result.is_array && result.element_type) {
+        result.element_type = std::make_unique<Type>(subst_template_type(*result.element_type, param_names, param_types));
+    }
+    if (result.is_function && result.return_type) {
+        result.return_type = std::make_unique<Type>(subst_template_type(*result.return_type, param_names, param_types));
+        for (auto& p : result.params) {
+            p.first = subst_template_type(p.first, param_names, param_types);
+        }
+    }
+    if (result.is_template_type) {
+        for (auto& ta : result.template_args) {
+            ta = subst_template_type(ta, param_names, param_types);
+        }
+    }
+    return result;
+}
+
+void SemanticAnalyzer::resolve_type(Type& t) {
+    // Resolve typeof -> concrete type
+    if (t.prim == PrimitiveKind::TYPEOF_DECLTYPE && t.typeof_expr) {
+        Type resolved = *t.typeof_expr;
+        t = resolved;
+        resolve_type(t);
+        return;
+    }
+    resolve_struct_type(t);
+    // Template type: instantiate the template struct
+    if (t.is_template_type) {
+        Symbol* ts = symtab.lookup(t.template_name);
+        if (ts && ts->kind == Symbol::TEMPLATE && ts->template_param_types.size() == t.template_args.size()) {
+            // Build param name list
+            std::vector<std::string> param_names;
+            for (auto& pt : ts->template_param_types)
+                param_names.push_back(pt.typedef_name);
+
+            // Create a unique mangled name for the concrete struct
+            std::string mangled = t.template_name + "$";
+            for (auto& arg : t.template_args) {
+                if (arg.is_typedef) mangled += arg.typedef_name;
+                else mangled += std::to_string((int)arg.prim);
+                mangled += "_";
+            }
+
+            // Check if already instantiated
+            if (struct_defs.find(mangled) == struct_defs.end()) {
+                // Find the generic struct definition in struct_defs
+                auto it = struct_defs.find(t.template_name);
+                if (it != struct_defs.end()) {
+                    std::vector<std::tuple<Type, std::string, long long>> concrete_members;
+                    for (auto& m : it->second) {
+                        std::string mname = std::get<1>(m);
+                        long long mbf = std::get<2>(m);
+                        Type mtype = subst_template_type(std::get<0>(m), param_names, t.template_args);
+                        concrete_members.push_back(std::make_tuple(std::move(mtype), std::move(mname), mbf));
+                    }
+                    struct_defs[mangled] = std::move(concrete_members);
+                }
+            }
+
+            // Convert to a regular struct type referencing our concrete
+            t.is_template_type = false;
+            t.is_struct = true;
+            t.tag_name = mangled;
+            t.has_members = false;
+            resolve_struct_type(t);
+        }
+    }
+    if (t.is_array) {
+        resolve_type(*t.element_type);
+    }
+    if (t.is_pointer && t.pointee) {
+        resolve_type(*t.pointee);
+    }
+}
+
 void SemanticAnalyzer::visit_var(VariableDecl& d) {
-    resolve_struct_type(d.var_type);
+    resolve_type(d.var_type);
     Symbol s;
     s.name = d.name;
     s.type = d.var_type;
@@ -269,17 +359,22 @@ void SemanticAnalyzer::visit_struct(StructDecl& d) {
     s.kind = d.is_union ? Symbol::TAG_UNION : Symbol::TAG_STRUCT;
     symtab.add(s);
 
-    std::vector<std::pair<Type, std::string>> members;
+    std::vector<std::tuple<Type, std::string, long long>> members_vec;
     for (auto& f : d.fields) {
         if (auto* fd = dynamic_cast<FieldDecl*>(f.get())) {
             resolve_struct_type(fd->field_type);
             if (fd->field_type.is_function) {
                 error("function field '" + fd->name + "' in struct", fd->loc);
             }
-            members.push_back({fd->field_type, fd->name});
+            long long bf = -1;
+            if (fd->bitfield_size) {
+                if (auto* ce = dynamic_cast<ConstantExpr*>(fd->bitfield_size.get()))
+                    bf = ce->value;
+            }
+            members_vec.push_back(std::make_tuple(fd->field_type, fd->name, bf));
         }
     }
-    struct_defs[d.name] = std::move(members);
+    struct_defs[d.name] = std::move(members_vec);
 }
 
 void SemanticAnalyzer::visit_enum(EnumDecl& d) {
@@ -721,7 +816,7 @@ Type SemanticAnalyzer::visit_member(MemberExpr& e) {
         obj_type = *obj_type.pointee;
     }
 
-    resolve_struct_type(obj_type);
+    resolve_type(obj_type);
 
     if (!obj_type.is_struct && !obj_type.is_union) {
         error("member access on non-struct/union type", e.object->loc);
@@ -729,8 +824,8 @@ Type SemanticAnalyzer::visit_member(MemberExpr& e) {
     }
 
     for (const auto& m : obj_type.members) {
-        if (m.second == e.member) {
-            return m.first;
+        if (std::get<1>(m) == e.member) {
+            return std::get<0>(m);
         }
     }
 
@@ -803,6 +898,57 @@ Type SemanticAnalyzer::visit_comma(CommaExpr& e) {
     return visit_expr(*e.rhs);
 }
 
+long long SemanticAnalyzer::eval_constant_expr(Expr& e) {
+    if (auto* ce = dynamic_cast<ConstantExpr*>(&e)) {
+        return ce->value;
+    }
+    if (auto* be = dynamic_cast<BinaryExpr*>(&e)) {
+        long long l = eval_constant_expr(*be->lhs);
+        long long r = eval_constant_expr(*be->rhs);
+        switch (be->op) {
+            case BinaryOp::ADD: return l + r;
+            case BinaryOp::SUB: return l - r;
+            case BinaryOp::MUL: return l * r;
+            case BinaryOp::DIV: return r != 0 ? l / r : 0;
+            case BinaryOp::MOD: return r != 0 ? l % r : 0;
+            case BinaryOp::EQ:  return l == r;
+            case BinaryOp::NE:  return l != r;
+            case BinaryOp::LT:  return l < r;
+            case BinaryOp::GT:  return l > r;
+            case BinaryOp::LE:  return l <= r;
+            case BinaryOp::GE:  return l >= r;
+            case BinaryOp::AND: return l && r;
+            case BinaryOp::OR:  return l || r;
+            case BinaryOp::BIT_AND: return l & r;
+            case BinaryOp::BIT_OR:  return l | r;
+            case BinaryOp::BIT_XOR: return l ^ r;
+            case BinaryOp::LSHIFT:  return l << r;
+            case BinaryOp::RSHIFT:  return (unsigned long long)l >> r;
+        }
+    }
+    if (auto* ue = dynamic_cast<UnaryExpr*>(&e)) {
+        long long op = eval_constant_expr(*ue->operand);
+        switch (ue->op) {
+            case UnaryOp::PLUS:    return op;
+            case UnaryOp::MINUS:   return -op;
+            case UnaryOp::NOT:     return !op;
+            case UnaryOp::BIT_NOT: return ~op;
+            default: return 0;
+        }
+    }
+    if (auto* ce = dynamic_cast<CastExpr*>(&e)) {
+        return eval_constant_expr(*ce->operand);
+    }
+    if (auto* paren = dynamic_cast<ConditionalExpr*>(&e)) {
+        long long cond = eval_constant_expr(*paren->cond);
+        if (cond) return eval_constant_expr(*paren->then_expr);
+        return eval_constant_expr(*paren->else_expr);
+    }
+    // Visit the expression to get side effects and ensure it's valid
+    visit_expr(e);
+    return 0;
+}
+
 Type SemanticAnalyzer::visit_constant(ConstantExpr& e) {
     Type t;
     // Determine type from the literal
@@ -840,7 +986,7 @@ Type SemanticAnalyzer::visit_identifier(IdentifierExpr& e) {
 
     switch (s->kind) {
         case Symbol::VARIABLE: {
-            resolve_struct_type(s->type);
+            resolve_type(s->type);
             return s->type;
         }
         case Symbol::FUNCTION: {
@@ -875,7 +1021,8 @@ void SemanticAnalyzer::resolve_struct_type(Type& t) {
     if ((t.is_struct || t.is_union) && !t.has_members && !t.tag_name.empty()) {
         auto it = struct_defs.find(t.tag_name);
         if (it != struct_defs.end()) {
-            t.members = it->second;
+            for (auto& m : it->second)
+                t.members.push_back(std::make_tuple(std::get<0>(m), std::get<1>(m), std::get<2>(m)));
             t.has_members = true;
         }
     }

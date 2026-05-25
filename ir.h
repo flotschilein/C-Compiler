@@ -89,16 +89,33 @@ struct IRStructDef {
     bool is_generic() const { return !type_params.empty(); }
 };
 
+// --- Global Variable ---
+
+struct IRGlobal {
+    std::string name;
+    IRType type;
+    bool is_defined = false;     // has an initializer
+    bool is_extern = false;
+    bool is_static = false;
+    bool is_thread_local = false;
+    // For simple constant initializers: the value
+    // (0 means zero-init; for struct/array init we track separately)
+    long long init_val = 0;
+    bool has_init = false;
+};
+
 // --- Module ---
 
 struct IRModule {
     std::vector<IRFunction> functions;
     std::vector<IRStructDef> structs;
     std::vector<std::string> global_strings;
+    std::vector<IRGlobal> globals;
 
     IRFunction* find_function(const std::string& name);
     IRStructDef* find_struct(const std::string& name);
     IRStructDef* add_struct(std::string name);
+    IRGlobal* find_global(const std::string& name);
 };
 
 #endif

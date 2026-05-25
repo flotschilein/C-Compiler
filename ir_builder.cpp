@@ -91,6 +91,7 @@ IRPrimitive IRBuilder::lower_prim(PrimitiveKind k) {
         case PrimitiveKind::COMPLEX_FLOAT:
         case PrimitiveKind::COMPLEX_DOUBLE:
         case PrimitiveKind::COMPLEX_LONGDOUBLE:
+            return IRPrimitive::F64; // Represent as a single f64 for now (component type widened)
         case PrimitiveKind::TYPEOF_DECLTYPE:
         default:                           return IRPrimitive::I32;
     }
@@ -121,6 +122,20 @@ IRType IRBuilder::lower_type(const Type& ast_type) {
         return IRTypeFactory::strukt(ast_type.template_name, args);
     }
     if (ast_type.is_struct || ast_type.is_union) {
+        // Ensure the struct definition exists in the module
+        if (ast_type.has_members && !ast_type.tag_name.empty()) {
+            IRStructDef* sdef = module.find_struct(ast_type.tag_name);
+            if (!sdef) {
+                IRStructDef new_def;
+                new_def.name = ast_type.tag_name;
+                new_def.is_defined = true;
+                for (auto& m : ast_type.members) {
+                    IRType ft = lower_type(std::get<0>(m));
+                    new_def.fields.push_back({std::move(ft), std::get<1>(m)});
+                }
+                module.structs.push_back(std::move(new_def));
+            }
+        }
         return IRTypeFactory::strukt(ast_type.tag_name);
     }
     if (ast_type.is_enum) {
@@ -135,10 +150,62 @@ IRType IRBuilder::lower_type(const Type& ast_type) {
         }
         return lower_prim(ast_type.prim);
     }
+    if (ast_type.prim == PrimitiveKind::TYPEOF_DECLTYPE && ast_type.typeof_expr) {
+        return lower_type(*ast_type.typeof_expr);
+    }
     return lower_prim(ast_type.prim);
 }
 
 // --- Type Size Helpers ---
+
+static long long align_up(long long offset, long long alignment) {
+    if (alignment <= 1) return offset;
+    return (offset + alignment - 1) & ~(alignment - 1);
+}
+
+static long long compute_type_align(const Type& type) {
+    if (type.is_pointer) return 8;
+    if (type.is_array) return compute_type_align(*type.element_type);
+    if (type.is_struct && type.has_members) {
+        long long max = 0;
+        for (auto& m : type.members)
+            max = std::max(max, compute_type_align(std::get<0>(m)));
+        return max > 0 ? max : 1;
+    }
+    if (type.is_union && type.has_members) {
+        long long max = 0;
+        for (auto& m : type.members)
+            max = std::max(max, compute_type_align(std::get<0>(m)));
+        return max > 0 ? max : 1;
+    }
+    if (type.is_enum) return 4;
+    if (type.is_function) return 8;
+    switch (type.prim) {
+        case PrimitiveKind::VOID:          return 1;
+        case PrimitiveKind::BOOL:          return 1;
+        case PrimitiveKind::CHAR:
+        case PrimitiveKind::S_CHAR:
+        case PrimitiveKind::U_CHAR:        return 1;
+        case PrimitiveKind::SHORT:
+        case PrimitiveKind::U_SHORT:       return 2;
+        case PrimitiveKind::INT:
+        case PrimitiveKind::U_INT:         return 4;
+        case PrimitiveKind::LONG:
+        case PrimitiveKind::U_LONG:
+        case PrimitiveKind::LONGLONG:
+        case PrimitiveKind::U_LONGLONG:    return 8;
+        case PrimitiveKind::FLOAT:         return 4;
+        case PrimitiveKind::DOUBLE:
+        case PrimitiveKind::LONGDOUBLE:    return 8;
+        case PrimitiveKind::COMPLEX_FLOAT:           return 4;
+        case PrimitiveKind::COMPLEX_DOUBLE:          return 8;
+        case PrimitiveKind::COMPLEX_LONGDOUBLE:      return 8;
+        case PrimitiveKind::TYPEOF_DECLTYPE:
+            if (type.typeof_expr) return compute_type_align(*type.typeof_expr);
+            return 4;
+        default:                           return 4;
+    }
+}
 
 static long long compute_type_size(const Type& type) {
     if (type.is_pointer) return 8;
@@ -150,15 +217,25 @@ static long long compute_type_size(const Type& type) {
     }
     if (type.is_struct && type.has_members) {
         long long total = 0;
-        for (auto& [ft, _] : type.members)
-            total += compute_type_size(ft);
-        return total;
+        long long max_align = 1;
+        for (auto& m : type.members) {
+            long long align = compute_type_align(std::get<0>(m));
+            if (align > max_align) max_align = align;
+            total = align_up(total, align);
+            total += compute_type_size(std::get<0>(m));
+        }
+        return align_up(total, max_align);
     }
     if (type.is_union && type.has_members) {
-        long long max = 0;
-        for (auto& [ft, _] : type.members)
-            max = std::max(max, compute_type_size(ft));
-        return max;
+        long long max_size = 0;
+        long long max_align = 1;
+        for (auto& m : type.members) {
+            long long a = compute_type_align(std::get<0>(m));
+            if (a > max_align) max_align = a;
+            long long s = compute_type_size(std::get<0>(m));
+            if (s > max_size) max_size = s;
+        }
+        return align_up(max_size, max_align);
     }
     if (type.is_enum) return 4;
     if (type.is_function) return 8;
@@ -179,55 +256,25 @@ static long long compute_type_size(const Type& type) {
         case PrimitiveKind::FLOAT:         return 4;
         case PrimitiveKind::DOUBLE:
         case PrimitiveKind::LONGDOUBLE:    return 8;
+        case PrimitiveKind::COMPLEX_FLOAT:           return 8;
+        case PrimitiveKind::COMPLEX_DOUBLE:          return 16;
+        case PrimitiveKind::COMPLEX_LONGDOUBLE:      return 16;
+        case PrimitiveKind::TYPEOF_DECLTYPE:
+            if (type.typeof_expr) return compute_type_size(*type.typeof_expr);
+            return 4;
         default:                           return 4;
     }
 }
 
 static long long compute_field_offset(const Type& struct_type, const std::string& member) {
     long long offset = 0;
-    for (auto& [ft, name] : struct_type.members) {
-        if (name == member) return offset;
-        offset += compute_type_size(ft);
+    for (auto& m : struct_type.members) {
+        long long align = compute_type_align(std::get<0>(m));
+        offset = align_up(offset, align);
+        if (std::get<1>(m) == member) return offset;
+        offset += compute_type_size(std::get<0>(m));
     }
     return -1;
-}
-
-static long long compute_type_align(const Type& type) {
-    if (type.is_pointer) return 8;
-    if (type.is_array) return compute_type_align(*type.element_type);
-    if (type.is_struct && type.has_members) {
-        long long max = 0;
-        for (auto& [ft, _] : type.members)
-            max = std::max(max, compute_type_align(ft));
-        return max > 0 ? max : 1;
-    }
-    if (type.is_union && type.has_members) {
-        long long max = 0;
-        for (auto& [ft, _] : type.members)
-            max = std::max(max, compute_type_align(ft));
-        return max > 0 ? max : 1;
-    }
-    if (type.is_enum) return 4;
-    if (type.is_function) return 8;
-    switch (type.prim) {
-        case PrimitiveKind::VOID:          return 1;
-        case PrimitiveKind::BOOL:          return 1;
-        case PrimitiveKind::CHAR:
-        case PrimitiveKind::S_CHAR:
-        case PrimitiveKind::U_CHAR:        return 1;
-        case PrimitiveKind::SHORT:
-        case PrimitiveKind::U_SHORT:       return 2;
-        case PrimitiveKind::INT:
-        case PrimitiveKind::U_INT:         return 4;
-        case PrimitiveKind::LONG:
-        case PrimitiveKind::U_LONG:
-        case PrimitiveKind::LONGLONG:
-        case PrimitiveKind::U_LONGLONG:    return 8;
-        case PrimitiveKind::FLOAT:         return 4;
-        case PrimitiveKind::DOUBLE:
-        case PrimitiveKind::LONGDOUBLE:    return 8;
-        default:                           return 4;
-    }
 }
 
 // --- Expression Lowering (rvalue) ---
@@ -329,8 +376,12 @@ size_t IRBuilder::lower_string(const StringExpr& expr) {
 size_t IRBuilder::lower_identifier_val(const IdentifierExpr& expr) {
     size_t addr = find_var(expr.name);
     if (addr == (size_t)-1) {
-        // External/global variable — treat as extern
-        // For now emit a placeholder constant
+        // Check if it's a global variable
+        IRGlobal* g = module.find_global(expr.name);
+        if (g) {
+            return emit(Instruction::CONST, lower_type(expr.result_type), {});
+        }
+        // External/global variable — treat as extern placeholder
         return emit(Instruction::CONST, lower_type(expr.result_type), {});
     }
     IRType loaded_type = lower_type(expr.result_type);
@@ -340,6 +391,13 @@ size_t IRBuilder::lower_identifier_val(const IdentifierExpr& expr) {
 size_t IRBuilder::lower_identifier_addr(const IdentifierExpr& expr) {
     size_t addr = find_var(expr.name);
     if (addr == (size_t)-1) {
+        // Check global
+        IRGlobal* g = module.find_global(expr.name);
+        if (g) {
+            size_t id = emit(Instruction::CONST, IRTypeFactory::ptr(g->type.copy()), {});
+            current_block->instructions.back().const_val.int_val = 0;
+            return id;
+        }
         throw std::runtime_error("unknown variable: " + expr.name);
     }
     return addr;
@@ -1172,9 +1230,28 @@ void IRBuilder::lower_decl(const Decl& decl) {
 }
 
 void IRBuilder::lower_var_decl(const VariableDecl& decl) {
-    if (!current_block) return; // skip globals at module scope for now
-
     IRType var_type = lower_type(decl.var_type);
+
+    if (!current_block) {
+        // Global scope — emit global variable
+        IRGlobal g;
+        g.name = decl.name;
+        g.type = var_type.copy();
+        g.is_extern = decl.is_extern;
+        g.is_static = decl.is_static;
+        g.is_thread_local = decl.is_thread_local;
+        g.has_init = decl.init != nullptr;
+        if (decl.init) {
+            if (auto* ce = dynamic_cast<const ConstantExpr*>(decl.init.get())) {
+                g.init_val = ce->value;
+            }
+            // For non-constant initializers, we just note that it has an init
+            // The actual initialization code is part of runtime, not compile-time
+        }
+        module.globals.push_back(std::move(g));
+        return;
+    }
+
     size_t alloca_id = emit(Instruction::ALLOCA, IRTypeFactory::ptr(var_type), {});
     current_block->instructions.back().extra_type = var_type.copy();
 
@@ -1196,7 +1273,7 @@ void IRBuilder::lower_var_decl(const VariableDecl& decl) {
                     current_block->instructions.back().gep_index = 0;
                     emit(Instruction::STORE, IRPrimitive::VOID, {val, field_addr});
                     if (i + 1 < result_type.members.size())
-                        off += compute_type_size(result_type.members[i].first);
+                        off += compute_type_size(std::get<0>(result_type.members[i]));
                 }
             } else {
                 size_t init_val = lower_expr(*decl.init);

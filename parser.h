@@ -19,6 +19,10 @@ private:
     std::set<std::string> typedef_names;
     std::set<std::string> template_param_names;
     bool saw_typedef = false;
+    bool saw_static = false;
+    bool saw_extern = false;
+    bool saw_thread_local = false;
+    bool saw_constexpr = false;
 
     // Helpers
     const ParserToken& peek(int offset = 0) const;
@@ -52,6 +56,7 @@ private:
     std::vector<std::unique_ptr<TemplateParamDecl>> parse_template_parameter_list();
     std::unique_ptr<TemplateParamDecl> parse_template_parameter();
     std::vector<Type> parse_template_argument_list();
+    bool is_template_param_type(const std::string& name) const { return template_param_names.count(name); }
     bool try_parse_template_id(std::unique_ptr<Expr>& e);
 
     // Statements
