@@ -79,6 +79,7 @@ void IRVerifier::check_ssa(const IRFunction& fn) {
 
     for (auto& block : fn.blocks) {
         for (auto& inst : block.instructions) {
+            if (inst.opcode == Instruction::NOP) continue;
             size_t id = expected_id;
             expected_id++;
 

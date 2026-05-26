@@ -29,7 +29,9 @@ struct Instruction {
         // Misc
         SELECT, EXTRACT,
         // Constants
-        CONST
+        CONST,
+        // Placeholder for removed/optimized instructions
+        NOP
     };
 
     Opcode opcode;

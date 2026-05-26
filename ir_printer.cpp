@@ -101,6 +101,7 @@ std::string IRPrinter::opcode_to_string(Instruction::Opcode op) {
         case Instruction::SELECT:    return "select";
         case Instruction::EXTRACT:   return "extract";
         case Instruction::CONST:     return "const";
+        case Instruction::NOP:       return "nop";
     }
     return "?";
 }
@@ -252,7 +253,8 @@ static bool is_terminator(Instruction::Opcode op) {
 
 static bool produces_value(Instruction::Opcode op) {
     return op != Instruction::STORE && op != Instruction::BR
-        && op != Instruction::BR_COND && op != Instruction::RET;
+        && op != Instruction::BR_COND && op != Instruction::RET
+        && op != Instruction::NOP;
 }
 
 std::string IRPrinter::print_function(const IRFunction& fn) {
@@ -283,6 +285,7 @@ std::string IRPrinter::print_function(const IRFunction& fn) {
     for (auto& block : fn.blocks) {
         os << block.label << ":\n";
         for (auto& inst : block.instructions) {
+            if (inst.opcode == Instruction::NOP) continue;
             bool has_val = produces_value(inst.opcode);
             os << "  ";
             if (has_val) {
