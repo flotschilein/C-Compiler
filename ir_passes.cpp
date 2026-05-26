@@ -473,7 +473,17 @@ static bool try_algebraic_simplify(const Instruction& inst,
         }
     }
 
-    if (const_idx < 0) return false; // no constant operand
+    if (const_idx < 0) {
+        // Same-operand patterns: or %x, %x → %x, and %x, %x → %x
+        if (inst.operands.size() >= 2 &&
+            inst.operands[0] == inst.operands[1] &&
+            (inst.opcode == Instruction::BIT_OR || inst.opcode == Instruction::BIT_AND))
+        {
+            forward_map[vid] = inst.operands[0];
+            return true;
+        }
+        return false; // no constant operand and no same-operand pattern
+    }
     // If both operands are constants, constant folding handles it
 
     switch (inst.opcode) {
@@ -854,89 +864,155 @@ bool LoadForwardingPass::run(IRModule& mod) {
     return changed;
 }
 
+// --- DeadStoreEliminationPass ---
+
+bool DeadStoreEliminationPass::run_on_function(IRFunction& fn) {
+    // Pre-compute alloca VIDs
+    std::set<size_t> alloca_set;
+    size_t vid = fn.params.size();
+    for (auto& block : fn.blocks) {
+        for (auto& inst : block.instructions) {
+            if (inst.opcode == Instruction::ALLOCA)
+                alloca_set.insert(vid);
+            vid++;
+        }
+    }
+
+    // Track which instruction VIDs are dead stores
+    std::set<size_t> dead_set;
+
+    // Precompute block base VIDs
+    std::vector<size_t> block_base;
+    size_t acc = fn.params.size();
+    for (auto& block : fn.blocks) {
+        block_base.push_back(acc);
+        acc += block.instructions.size();
+    }
+
+    for (size_t bi = 0; bi < fn.blocks.size(); bi++) {
+        auto& block = fn.blocks[bi];
+        size_t base = block_base[bi];
+
+        // Forward walk: last_store[ptr_vid] = inst_vid of last store to ptr
+        // that has NOT been consumed by a subsequent load.
+        std::map<size_t, size_t> last_store;
+
+        for (size_t ii = 0; ii < block.instructions.size(); ii++) {
+            auto& inst = block.instructions[ii];
+            size_t inst_vid = base + ii;
+
+            if (inst.opcode == Instruction::STORE) {
+                size_t ptr = inst.operands[1];
+                if (alloca_set.count(ptr)) {
+                    auto it = last_store.find(ptr);
+                    if (it != last_store.end()) {
+                        dead_set.insert(it->second);
+                        last_store.erase(it);
+                    }
+                    last_store[ptr] = inst_vid;
+                }
+            } else if (inst.opcode == Instruction::LOAD) {
+                size_t ptr = inst.operands[0];
+                if (alloca_set.count(ptr)) {
+                    last_store.erase(ptr);
+                }
+            } else if (inst.opcode == Instruction::CALL) {
+                last_store.clear();
+            }
+        }
+    }
+
+    if (dead_set.empty()) return false;
+
+    // Remove dead stores and renumber
+    size_t n = fn.next_value_id;
+    std::vector<size_t> old_to_new(n, (size_t)-1);
+    for (size_t i = 0; i < fn.params.size(); i++)
+        old_to_new[i] = i;
+
+    size_t new_vid = fn.params.size();
+    for (size_t bi = 0; bi < fn.blocks.size(); bi++) {
+        auto& block = fn.blocks[bi];
+        size_t base = block_base[bi];
+        std::vector<Instruction> new_insts;
+        for (size_t ii = 0; ii < block.instructions.size(); ii++) {
+            size_t old_vid = base + ii;
+            if (dead_set.count(old_vid)) continue;
+            old_to_new[old_vid] = new_vid++;
+            new_insts.push_back(std::move(block.instructions[ii]));
+        }
+        block.instructions = std::move(new_insts);
+    }
+
+    for (auto& block : fn.blocks) {
+        for (auto& inst : block.instructions) {
+            for (auto& op : inst.operands)
+                op = old_to_new[op];
+            for (auto& [val, label] : inst.phi_incoming)
+                val = old_to_new[val];
+        }
+    }
+
+    fn.next_value_id = new_vid;
+    return true;
+}
+
+bool DeadStoreEliminationPass::run(IRModule& mod) {
+    bool changed = false;
+    for (auto& fn : mod.functions) {
+        if (!fn.is_defined || fn.is_generic()) continue;
+        if (run_on_function(fn)) changed = true;
+    }
+    return changed;
+}
+
 // --- ControlFlowSimplifyPass ---
 
 bool ControlFlowSimplifyPass::run_on_function(IRFunction& fn) {
     bool changed = false;
 
-    // --- Fold constant branches ---
+    // Pre-compute vid -> is_const(0/1) map using current positional VIDs
+    std::map<size_t, int> const_branch_val;
+    size_t vid = fn.params.size();
+    for (auto& block : fn.blocks) {
+        for (auto& inst : block.instructions) {
+            if (inst.opcode == Instruction::CONST &&
+                inst.result_type.is_prim() &&
+                (inst.result_type.as_prim() == IRPrimitive::I1 ||
+                 inst.result_type.as_prim() == IRPrimitive::I32))
+            {
+                long long cv = inst.const_val.int_val;
+                if (cv == 0 || cv == 1)
+                    const_branch_val[vid] = (int)cv;
+            }
+            vid++;
+        }
+    }
+
+    // Fold constant branches: br_cond const 1/0 -> br target
+    // This does NOT remove blocks (to preserve VID integrity).
+    // Unreachable blocks will be detected and removed on a subsequent
+    // pass iteration with proper VID rebuilding.
     for (auto& block : fn.blocks) {
         if (block.instructions.empty()) continue;
         auto& term = block.instructions.back();
         if (term.opcode != Instruction::BR_COND) continue;
         if (term.operands.empty()) continue;
 
-        // Check if condition is a constant
-        // We need the VID of the condition operand. We can look it up but we don't
-        // have the VID mapping here easily. Let me compute it.
-    }
+        size_t cond_vid = term.operands[0];
+        auto it = const_branch_val.find(cond_vid);
+        if (it == const_branch_val.end()) continue;
 
-    // --- Merge blocks: if A -> B (unconditional) and B has only one predecessor, merge ---
-    // Compute predecessor counts
-    std::map<std::string, std::set<std::string>> predecessors;
-    for (auto& block : fn.blocks) {
-        if (block.instructions.empty()) continue;
-        auto& term = block.instructions.back();
-        if (term.opcode == Instruction::BR) {
-            predecessors[term.target_label].insert(block.label);
-        } else if (term.opcode == Instruction::BR_COND) {
-            predecessors[term.true_label].insert(block.label);
-            predecessors[term.false_label].insert(block.label);
+        if (it->second != 0) {
+            term.opcode = Instruction::BR;
+            term.target_label = term.true_label;
+        } else {
+            term.opcode = Instruction::BR;
+            term.target_label = term.false_label;
         }
-    }
-
-    std::set<std::string> blocks_to_remove;
-    for (size_t i = 0; i < fn.blocks.size(); i++) {
-        auto& block = fn.blocks[i];
-        if (block.instructions.empty()) continue;
-        auto& term = block.instructions.back();
-        if (term.opcode != Instruction::BR) continue;
-        std::string target = term.target_label;
-
-        // Only merge if target has exactly one predecessor (this block)
-        auto pit = predecessors.find(target);
-        if (pit == predecessors.end() || pit->second.size() != 1) continue;
-        if (target == block.label) continue; // self-loop
-
-        // Find target block
-        size_t target_idx = (size_t)-1;
-        for (size_t j = 0; j < fn.blocks.size(); j++) {
-            if (fn.blocks[j].label == target) { target_idx = j; break; }
-        }
-        if (target_idx == (size_t)-1) continue;
-
-        // Merge: copy target's instructions into this block (after removing the terminator)
-        auto& target_block = fn.blocks[target_idx];
-        auto& target_insts = target_block.instructions;
-
-        // Remove the trailing BR from this block
-        block.instructions.pop_back();
-
-        // Append all instructions from target block
-        for (auto& inst : target_insts) {
-            block.instructions.push_back(std::move(inst));
-        }
-
-        // Update predecessor references: anyone who referred to target should refer to this block
-        // (but target only had one predecessor, which is this block)
-        blocks_to_remove.insert(target);
-
-        // Remap branch targets in the merged block
-        // PHI nodes in the target that referenced the old entry block need updating
-        // Actually, the PHI entries from this block's predecessor are still valid
-        // PHI entries from other predecessors don't exist (single predecessor)
-
-        changed = true;
-    }
-
-    // Remove merged blocks
-    if (!blocks_to_remove.empty()) {
-        std::vector<IRBlock> new_blocks;
-        for (auto& block : fn.blocks) {
-            if (blocks_to_remove.count(block.label)) continue;
-            new_blocks.push_back(std::move(block));
-        }
-        fn.blocks = std::move(new_blocks);
+        term.true_label.clear();
+        term.false_label.clear();
+        term.operands.clear();
         changed = true;
     }
 

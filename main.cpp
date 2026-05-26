@@ -78,6 +78,7 @@ int main(int ac, char* av[]) {
                 pm.add_pass(std::make_unique<SimplifyPass>());
                 pm.add_pass(std::make_unique<DeadCodeEliminationPass>());
                 pm.add_pass(std::make_unique<LoadForwardingPass>());
+                pm.add_pass(std::make_unique<DeadStoreEliminationPass>());
                 pm.add_pass(std::make_unique<ControlFlowSimplifyPass>());
                 pm.add_pass(std::make_unique<SimplifyPass>());
                 pm.add_pass(std::make_unique<DeadCodeEliminationPass>());

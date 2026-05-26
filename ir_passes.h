@@ -40,6 +40,13 @@ public:
     const char* name() const override { return "load-forwarding"; }
 };
 
+class DeadStoreEliminationPass : public IRPass {
+    bool run_on_function(IRFunction& fn);
+public:
+    bool run(IRModule& mod) override;
+    const char* name() const override { return "dead-store"; }
+};
+
 class ControlFlowSimplifyPass : public IRPass {
     bool run_on_function(IRFunction& fn);
 public:
