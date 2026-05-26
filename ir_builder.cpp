@@ -277,6 +277,50 @@ static long long compute_field_offset(const Type& struct_type, const std::string
     return -1;
 }
 
+// --- Init-List Lowering ---
+
+// Emit stores for an InitListExpr into a pre-allocated address,
+// given the AST type (which carries struct member info).
+// Works for structs and arrays.
+void IRBuilder::emit_init_list(const Type& ast_type, size_t addr,
+                                const InitListExpr& list)
+{
+    if (ast_type.is_struct && ast_type.has_members) {
+        long long off = 0;
+        for (size_t i = 0; i < list.inits.size() && i < ast_type.members.size(); i++) {
+            size_t val = lower_expr(*list.inits[i]);
+            size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+            current_block->instructions.back().const_val.int_val = off;
+            size_t field_addr = emit(Instruction::GEP,
+                IRTypeFactory::ptr(IRPrimitive::VOID), {addr, off_val});
+            current_block->instructions.back().extra_type = IRPrimitive::I8;
+            current_block->instructions.back().gep_index = 0;
+            emit(Instruction::STORE, IRPrimitive::VOID, {val, field_addr});
+            if (i + 1 < ast_type.members.size())
+                off += compute_type_size(std::get<0>(ast_type.members[i]));
+        }
+    } else if (ast_type.is_array && ast_type.element_type) {
+        long long elem_size = compute_type_size(*ast_type.element_type);
+        for (size_t i = 0; i < list.inits.size(); i++) {
+            size_t val = lower_expr(*list.inits[i]);
+            long long off = (long long)i * elem_size;
+            size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+            current_block->instructions.back().const_val.int_val = off;
+            size_t elem_addr = emit(Instruction::GEP,
+                IRTypeFactory::ptr(IRPrimitive::VOID), {addr, off_val});
+            current_block->instructions.back().extra_type = IRPrimitive::I8;
+            current_block->instructions.back().gep_index = 0;
+            emit(Instruction::STORE, IRPrimitive::VOID, {val, elem_addr});
+        }
+    } else {
+        // Scalar or unknown: lower the first initializer and store
+        if (!list.inits.empty()) {
+            size_t val = lower_expr(*list.inits[0]);
+            emit(Instruction::STORE, IRPrimitive::VOID, {val, addr});
+        }
+    }
+}
+
 // --- Expression Lowering (rvalue) ---
 
 size_t IRBuilder::lower_expr(const Expr& expr) {
@@ -310,13 +354,27 @@ size_t IRBuilder::lower_expr(const Expr& expr) {
         size_t addr = emit(Instruction::ALLOCA, IRTypeFactory::ptr(t), {});
         current_block->instructions.back().extra_type = t.copy();
         if (e->init) {
-            size_t val = lower_expr(*e->init);
-            emit(Instruction::STORE, IRPrimitive::VOID, {val, addr});
+            if (auto* il = dynamic_cast<const InitListExpr*>(e->init.get())) {
+                emit_init_list(e->literal_type, addr, *il);
+            } else {
+                size_t val = lower_expr(*e->init);
+                emit(Instruction::STORE, IRPrimitive::VOID, {val, addr});
+            }
         }
         return addr;
     }
     if (auto* e = dynamic_cast<const InitListExpr*>(&expr)) {
+        // Standalone init list (not in declaration or compound literal).
+        // For aggregates, allocate storage and emit memberwise stores.
         if (e->inits.empty()) return emit(Instruction::CONST, IRPrimitive::I32, {});
+        Type rt = expr.result_type;
+        if ((rt.is_struct && rt.has_members) || (rt.is_array && rt.element_type)) {
+            IRType ir_type = lower_type(rt);
+            size_t addr = emit(Instruction::ALLOCA, IRTypeFactory::ptr(ir_type), {});
+            current_block->instructions.back().extra_type = ir_type.copy();
+            emit_init_list(rt, addr, *e);
+            return addr;
+        }
         return lower_expr(*e->inits[0]);
     }
 
@@ -343,6 +401,14 @@ size_t IRBuilder::lower_expr_addr(const Expr& expr) {
             // *p as lvalue means p is already a pointer
             return lower_expr(*e->operand);
         }
+    }
+    if (dynamic_cast<const CompoundLiteralExpr*>(&expr)) {
+        // lower_expr already returns the address for compound literals
+        return lower_expr(expr);
+    }
+    if (dynamic_cast<const InitListExpr*>(&expr)) {
+        // lower_expr returns the address for aggregate init lists
+        return lower_expr(expr);
     }
     return (size_t)-1; // not an lvalue
 }
@@ -657,12 +723,85 @@ size_t IRBuilder::lower_cast(const CastExpr& expr) {
 }
 
 size_t IRBuilder::lower_assign(const AssignExpr& expr) {
+    Type lhs_type = expr.lhs->result_type;
+
+    // Struct/array assignment: memberwise copy
+    if (expr.op == AssignOp::ASSIGN &&
+        ((lhs_type.is_struct && lhs_type.has_members) ||
+         lhs_type.is_array))
+    {
+        size_t dst_addr = lower_expr_addr(*expr.lhs);
+        if (dst_addr == (size_t)-1) {
+            if (auto* unary = dynamic_cast<const UnaryExpr*>(expr.lhs.get()))
+                if (unary->op == UnaryOp::DEREF)
+                    dst_addr = lower_expr(*unary->operand);
+        }
+        if (dst_addr == (size_t)-1) return 0;
+
+        size_t src_addr = lower_expr_addr(*expr.rhs);
+
+        if (src_addr != (size_t)-1) {
+            if (lhs_type.is_struct && lhs_type.has_members) {
+                long long off = 0;
+                size_t last_val = 0;
+                for (size_t i = 0; i < lhs_type.members.size(); i++) {
+                    long long align = compute_type_align(std::get<0>(lhs_type.members[i]));
+                    off = align_up(off, align);
+                    IRType member_type = lower_type(std::get<0>(lhs_type.members[i]));
+                    size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+                    current_block->instructions.back().const_val.int_val = off;
+                    size_t src_field = emit(Instruction::GEP,
+                        IRTypeFactory::ptr(IRPrimitive::VOID), {src_addr, off_val});
+                    current_block->instructions.back().extra_type = IRPrimitive::I8;
+                    current_block->instructions.back().gep_index = 0;
+                    size_t field_val = emit(Instruction::LOAD, member_type, {src_field});
+                    size_t off_val2 = emit(Instruction::CONST, IRPrimitive::I64, {});
+                    current_block->instructions.back().const_val.int_val = off;
+                    size_t dst_field = emit(Instruction::GEP,
+                        IRTypeFactory::ptr(IRPrimitive::VOID), {dst_addr, off_val2});
+                    current_block->instructions.back().extra_type = IRPrimitive::I8;
+                    current_block->instructions.back().gep_index = 0;
+                    emit(Instruction::STORE, IRPrimitive::VOID, {field_val, dst_field});
+                    off += compute_type_size(std::get<0>(lhs_type.members[i]));
+                    last_val = field_val;
+                }
+                return last_val;
+            }
+            if (lhs_type.is_array && lhs_type.element_type) {
+                long long elem_size = compute_type_size(*lhs_type.element_type);
+                long long num = 0;
+                if (auto* cst = std::get_if<long long>(&lhs_type.array_size.size))
+                    num = *cst;
+                size_t last_val = 0;
+                for (long long i = 0; i < num; i++) {
+                    long long off = i * elem_size;
+                    IRType elem_type = lower_type(*lhs_type.element_type);
+                    size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
+                    current_block->instructions.back().const_val.int_val = off;
+                    size_t src_elem = emit(Instruction::GEP,
+                        IRTypeFactory::ptr(IRPrimitive::VOID), {src_addr, off_val});
+                    current_block->instructions.back().extra_type = IRPrimitive::I8;
+                    current_block->instructions.back().gep_index = 0;
+                    size_t elem_val = emit(Instruction::LOAD, elem_type, {src_elem});
+                    size_t off_val2 = emit(Instruction::CONST, IRPrimitive::I64, {});
+                    current_block->instructions.back().const_val.int_val = off;
+                    size_t dst_elem = emit(Instruction::GEP,
+                        IRTypeFactory::ptr(IRPrimitive::VOID), {dst_addr, off_val2});
+                    current_block->instructions.back().extra_type = IRPrimitive::I8;
+                    current_block->instructions.back().gep_index = 0;
+                    emit(Instruction::STORE, IRPrimitive::VOID, {elem_val, dst_elem});
+                    last_val = elem_val;
+                }
+                return last_val;
+            }
+        }
+    }
+
+    // Scalar assignment
     size_t rhs = lower_expr(*expr.rhs);
     size_t addr = lower_expr_addr(*expr.lhs);
 
     if (addr == (size_t)-1) {
-        // Not an lvalue (e.g., assignment to dereference)
-        // For *p = val, the RHS is already computed; the LHS expr gives the pointer
         if (auto* unary = dynamic_cast<const UnaryExpr*>(expr.lhs.get())) {
             if (unary->op == UnaryOp::DEREF) {
                 addr = lower_expr(*unary->operand);
@@ -1259,25 +1398,14 @@ void IRBuilder::lower_var_decl(const VariableDecl& decl) {
         var_stack.back()[decl.name] = alloca_id;
 
     if (decl.init) {
-        // Handle init list directly: store each field to the alloca
         if (auto* init_list = dynamic_cast<const InitListExpr*>(decl.init.get())) {
-            Type result_type = decl.var_type;
-            if (result_type.is_struct && result_type.has_members) {
-                long long off = 0;
-                for (size_t i = 0; i < init_list->inits.size() && i < result_type.members.size(); i++) {
-                    size_t val = lower_expr(*init_list->inits[i]);
-                    size_t off_val = emit(Instruction::CONST, IRPrimitive::I64, {});
-                    current_block->instructions.back().const_val.int_val = off;
-                    size_t field_addr = emit(Instruction::GEP, IRTypeFactory::ptr(IRPrimitive::VOID), {alloca_id, off_val});
-                    current_block->instructions.back().extra_type = IRPrimitive::I8;
-                    current_block->instructions.back().gep_index = 0;
-                    emit(Instruction::STORE, IRPrimitive::VOID, {val, field_addr});
-                    if (i + 1 < result_type.members.size())
-                        off += compute_type_size(std::get<0>(result_type.members[i]));
-                }
-            } else {
-                size_t init_val = lower_expr(*decl.init);
-                emit(Instruction::STORE, IRPrimitive::VOID, {init_val, alloca_id});
+            emit_init_list(decl.var_type, alloca_id, *init_list);
+        } else if (auto* cl = dynamic_cast<const CompoundLiteralExpr*>(decl.init.get())) {
+            if (auto* il = dynamic_cast<const InitListExpr*>(cl->init.get())) {
+                emit_init_list(cl->literal_type, alloca_id, *il);
+            } else if (cl->init) {
+                size_t val = lower_expr(*cl->init);
+                emit(Instruction::STORE, IRPrimitive::VOID, {val, alloca_id});
             }
         } else {
             size_t init_val = lower_expr(*decl.init);

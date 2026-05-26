@@ -289,6 +289,15 @@ std::unique_ptr<Expr> Parser::parse_cast_expression() {
             consume(); // (
             Type t = parse_type_name();
             expect(TokenKind::RPAREN, "expected ')' in cast expression");
+
+            // Compound literal: (type){init}
+            if (peek().kind == TokenKind::LBRACE) {
+                auto cl = std::make_unique<CompoundLiteralExpr>();
+                cl->literal_type = std::move(t);
+                cl->init = parse_initializer();
+                return cl;
+            }
+
             auto c = std::make_unique<CastExpr>();
             c->cast_type = std::move(t);
             c->operand = parse_cast_expression();

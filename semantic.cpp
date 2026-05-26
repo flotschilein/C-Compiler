@@ -1090,6 +1090,7 @@ Type SemanticAnalyzer::visit_nullptr(NullptrExpr& e) {
 
 Type SemanticAnalyzer::visit_compound_literal(CompoundLiteralExpr& e) {
     if (e.init) visit_expr(*e.init);
+    resolve_struct_type(e.literal_type);
     return e.literal_type;
 }
 

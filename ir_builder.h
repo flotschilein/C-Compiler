@@ -103,6 +103,11 @@ class IRBuilder {
     void lower_template_decl(const TemplateDecl& decl);
     size_t lower_template_id(const TemplateIdExpr& expr);
 
+    // Init-list helper: stores each field/element from an InitListExpr
+    // into the given alloca address, based on the AST type.
+    void emit_init_list(const Type& ast_type, size_t addr,
+                        const InitListExpr& list);
+
     void collect_switch_cases(const Stmt& stmt, std::vector<SwitchCase>& cases, std::string& default_label);
 
 public:
